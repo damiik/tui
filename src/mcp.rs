@@ -10,21 +10,25 @@ pub enum McpClientEvent {
     Disconnected,
     Message(String),
     Error(String),
+    ToolsListed(Vec<String>),
 }
 
 #[derive(Debug)]
 pub struct McpClient {
     event_tx: mpsc::Sender<McpClientEvent>,
+    client: Client,
+    url: Option<String>,
 }
 
 impl McpClient {
     pub fn new(event_tx: mpsc::Sender<McpClientEvent>) -> Self {
-        Self { event_tx }
+        Self { event_tx, client: Client::new(), url: None }
     }
 
-    pub async fn connect(&self, url: String, _server_name: String) {
-        let client = Client::new();
+    pub async fn connect(&mut self, url: String, _server_name: String) {
+        self.url = Some(url.clone());
         let event_tx = self.event_tx.clone();
+        let client = self.client.clone();
 
         tokio::spawn(async move {
             match client.get(&url).send().await {
@@ -39,14 +43,46 @@ impl McpClient {
                         return;
                     }
 
+                    // NEW ✅: Wyślij initialize
+                    let init = ops::create_initialize_request("1.0");
+                    if let Ok(body) = ops::serialize_request(&init) {
+                        let _ = client.post(&url).body(body).send().await;
+                    }
+
                     let _ = event_tx.send(McpClientEvent::Connected).await;
+
                     let mut stream = response.bytes_stream();
 
                     while let Some(item) = stream.next().await {
+                        println!("mcp stream match");
                         match item {
                             Ok(bytes) => {
                                 let msg = String::from_utf8_lossy(&bytes).to_string();
-                                let _ = event_tx.send(McpClientEvent::Message(msg)).await;
+println!("ok bytes: {}", msg.clone());
+                                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&msg) {
+                                    if let Some(result) = json.get("result") {
+                                        // SUCCESS without matching enum
+                                        println!("response ok.");
+                                
+                                        if let Some(tools) = result.get("tools") {
+                                            println!("some tools");
+                                            if let Ok(tool_list) = serde_json::from_value::<Vec<String>>(tools.clone()) {
+                                                let _ = event_tx.send(McpClientEvent::ToolsListed(tool_list)).await;
+                                                continue;
+                                            }
+                                        }
+                                        let _ = event_tx.send(
+                                            McpClientEvent::Message(
+                                            serde_json::to_string_pretty(&result).unwrap_or(msg)
+                                        )).await;
+
+                                        continue;
+                                    }
+                                }
+                                else {
+
+                                    let _ = event_tx.send(McpClientEvent::Message(msg)).await;
+                                }
                             }
                             Err(e) => {
                                 let _ = event_tx
@@ -65,6 +101,36 @@ impl McpClient {
                 }
             }
         });
+    }
+
+    pub async fn list_tools(&self) {
+        if let Some(url) = &self.url {
+            let list_tools_req = ops::create_list_tools_request();
+            let req_body = ops::serialize_request(&list_tools_req).unwrap();
+            let client = self.client.clone();
+            let url_clone = url.clone();
+            let event_tx = self.event_tx.clone();
+
+            tokio::spawn(async move {
+                match client.post(url_clone).body(req_body).send().await {
+                    Ok(response) => {
+                        if !response.status().is_success() {
+                            let _ = event_tx
+                                .send(McpClientEvent::Error(format!(
+                                    "Failed to list tools: {}",
+                                    response.status()
+                                )))
+                                .await;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = event_tx
+                            .send(McpClientEvent::Error(format!("Failed to list tools: {}", e)))
+                            .await;
+                    }
+                }
+            });
+        }
     }
 }
 

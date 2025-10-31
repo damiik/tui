@@ -16,8 +16,9 @@ pub enum Command {
     Clear,
     Echo(String),
     Help,
-    Connect { url: String, name: String },
+    McpConnect(Option<String>),
     McpList,
+    McpTools,
 }
 
 impl Command {
@@ -45,14 +46,12 @@ impl Command {
                     Ok(Command::Echo(rest.join(" ")))
                 }
             }
-            ["cn", url, name] | ["connect", url, name] => Ok(Command::Connect {
-                url: url.to_string(),
-                name: name.to_string(),
-            }),
-            ["cn"] | ["connect"] => Err(CommandError::InvalidSyntax(
-                "connect requires a URL and a server name".into(),
-            )),
+            ["mcp", "cn"] | ["mcp", "connect"] => Ok(Command::McpConnect(None)),
+            ["mcp", "cn", name] | ["mcp", "connect", name] => {
+                Ok(Command::McpConnect(Some(name.to_string())))
+            }
             ["mcp", "list"] => Ok(Command::McpList),
+            ["mcp", "tools"] => Ok(Command::McpTools),
             [cmd, ..] => Err(CommandError::Unknown(cmd.to_string())),
             [] => unreachable!(), // Already handled empty case
         }
@@ -120,36 +119,29 @@ mod tests {
     }
 
     #[test]
-    fn test_connect_command() {
+    fn test_mcp_connect_command() {
         assert_eq!(
-            Command::parse("connect http://localhost:8080/sse pcbvi-mcp-server"),
-            Ok(Command::Connect {
-                url: "http://localhost:8080/sse".into(),
-                name: "pcbvi-mcp-server".into()
-            })
+            Command::parse("mcp connect pcbvi-mcp-server"),
+            Ok(Command::McpConnect(Some("pcbvi-mcp-server".into())))
         );
         assert_eq!(
-            Command::parse("cn http://localhost:8080/sse pcbvi-mcp-server"),
-            Ok(Command::Connect {
-                url: "http://localhost:8080/sse".into(),
-                name: "pcbvi-mcp-server".into()
-            })
+            Command::parse("mcp cn pcbvi-mcp-server"),
+            Ok(Command::McpConnect(Some("pcbvi-mcp-server".into())))
         );
-    }
-
-    fn test_connect_without_args() {
-        assert!(matches!(
-            Command::parse("connect"),
-            Err(CommandError::InvalidSyntax(_))
-        ));
-        assert!(matches!(
-            Command::parse("cn"),
-            Err(CommandError::InvalidSyntax(_))
-        ));
+        assert_eq!(
+            Command::parse("mcp connect"),
+            Ok(Command::McpConnect(None))
+        );
+        assert_eq!(Command::parse("mcp cn"), Ok(Command::McpConnect(None)));
     }
 
     #[test]
     fn test_mcp_list_command() {
         assert_eq!(Command::parse("mcp list"), Ok(Command::McpList));
+    }
+
+    #[test]
+    fn test_mcp_tools_command() {
+        assert_eq!(Command::parse("mcp tools"), Ok(Command::McpTools));
     }
 }

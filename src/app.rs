@@ -100,6 +100,12 @@ impl App {
             McpClientEvent::Error(err) => {
                 self.output = self.output.with_message(format!("[MCP Error] {}", err));
             }
+            McpClientEvent::ToolsListed(tools) => {
+                self.output = self.output.with_message("Available tools:".to_string());
+                for tool in tools {
+                    self.output = self.output.with_message(format!("  - {}", tool));
+                }
+            }
         }
         Ok(self)
     }
@@ -240,15 +246,27 @@ impl App {
                     .with_message("  :q, :quit                - Exit application".to_string())
                     .with_message("  :clear                   - Clear output".to_string())
                     .with_message("  :echo <text>             - Echo text to output".to_string())
-                    .with_message("  :connect <url> <name>    - Connect to MCP server".to_string())
-                    .with_message("  :cn <url> <name>         - Alias for connect".to_string())
                     .with_message("  :mcp list                - List configured MCP servers".to_string())
+                    .with_message("  :mcp tools               - List tools of connected MCP server".to_string())
+                    .with_message("  :mcp cn, :mcp connect    - Connect to MCP server".to_string())
                     .with_message("  :h, :help                - Show this help".to_string());
                 self.status = "Help displayed".into();
             }
-            Ok(Command::Connect { url, name }) => {
-                self.status = format!("Connecting to {}...", url);
-                self.mcp_client.connect(url, name).await;
+            Ok(Command::McpConnect(server_name)) => {
+                if let Some(name) = server_name {
+                    if let Some(server) = self.config.mcp_servers.iter().find(|s| s.name == name) {
+                        self.status = format!("Connecting to {}...", server.url);
+                        self.mcp_client.connect(server.url.clone(), server.name.clone()).await;
+                    } else {
+                        self.status = format!("Server '{}' not found in config.json", name);
+                    }
+                } else {
+                    self.output = self.output.with_message("Available MCP servers:".to_string());
+                    for (i, server) in self.config.mcp_servers.iter().enumerate() {
+                        self.output = self.output.with_message(format!("  [{}] {}: {}", i + 1, server.name, server.url));
+                    }
+                    self.output = self.output.with_message("Usage: :mcp connect [server_name|server_number]".to_string());
+                }
             }
             Ok(Command::McpList) => {
                 self.output = self.output.with_message("Configured MCP servers:".to_string());
@@ -257,6 +275,10 @@ impl App {
                         .output
                         .with_message(format!("  - {}: {}", server.name, server.url));
                 }
+            }
+            Ok(Command::McpTools) => {
+                self.status = "Listing tools...".to_string();
+                self.mcp_client.list_tools().await;
             }
             Err(e) => {
                 self.status = format!("Error: {}", e);
