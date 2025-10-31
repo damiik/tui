@@ -1,0 +1,18 @@
+[package]
+name = "thi"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.29"
+anyhow = "1.0"
+thiserror = "1.0"
+
+[lib]
+name = "mcp_client"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mcp-client"
+path = "src/main.rs"
