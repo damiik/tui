@@ -1,12 +1,15 @@
 use crate::command::Command;
+use crate::config::Config;
 use crate::event::Event;
+use crate::mcp::{McpClient, McpClientEvent};
 use crate::mode::Mode;
 use crate::state::{Buffer, OutputLog};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyModifiers};
+use tokio::sync::mpsc;
 
 /// Immutable application state with functional transitions
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct App {
     mode: Mode,
     output: OutputLog,
@@ -14,23 +17,29 @@ pub struct App {
     command_buffer: Buffer,
     status: String,
     quit: bool,
+    mcp_client: McpClient,
+    pub mcp_event_rx: mpsc::Receiver<McpClientEvent>,
+    config: Config,
 }
 
 impl App {
-    pub fn new() -> Self {
+    pub fn new(config: Config) -> Self {
+        let (mcp_event_tx, mcp_event_rx) = mpsc::channel(100);
+        let mcp_client = McpClient::new(mcp_event_tx);
+
         Self {
             mode: Mode::Normal,
-            output: OutputLog::new().with_message("MCP Client initialized. Press 'i' for INSERT mode.".to_string()),
+            output: OutputLog::new()
+                .with_message("MCP Client initialized. Press 'i' for INSERT mode.".to_string()),
             input_buffer: Buffer::new(),
             command_buffer: Buffer::new(),
             status: "Ready".into(),
             quit: false,
+            mcp_client,
+            mcp_event_rx,
+            config,
         }
     }
-
-    // ═══════════════════════════════════════════════════════════════
-    // Pure accessors (no side effects)
-    // ═══════════════════════════════════════════════════════════════
 
     pub const fn mode(&self) -> Mode {
         self.mode
@@ -64,37 +73,50 @@ impl App {
         self.quit
     }
 
-    // ═══════════════════════════════════════════════════════════════
-    // Event handler: Self → Event → Result<Self>
-    // Core functional transformation
-    // ═══════════════════════════════════════════════════════════════
-
-    pub fn handle_event(self, event: Event) -> Result<Self> {
+    pub async fn handle_event(mut self, event: Event) -> Result<Self> {
         match event {
-            Event::Key(key) => self.handle_key(key.code, key.modifiers),
-            Event::Tick => Ok(self),
+            Event::Key(key) => self.handle_key(key.code, key.modifiers).await,
+            Event::Tick => {
+                if let Ok(mcp_event) = self.mcp_event_rx.try_recv() {
+                    self.handle_mcp_event(mcp_event).await
+                } else {
+                    Ok(self)
+                }
+            }
         }
     }
 
-    fn handle_key(self, code: KeyCode, mods: KeyModifiers) -> Result<Self> {
-        // Global keybindings
+    async fn handle_mcp_event(mut self, event: McpClientEvent) -> Result<Self> {
+        match event {
+            McpClientEvent::Connected => {
+                self.status = "MCP client connected".into();
+            }
+            McpClientEvent::Disconnected => {
+                self.status = "MCP client disconnected".into();
+            }
+            McpClientEvent::Message(msg) => {
+                self.output = self.output.with_message(format!("[MCP] {}", msg));
+            }
+            McpClientEvent::Error(err) => {
+                self.output = self.output.with_message(format!("[MCP Error] {}", err));
+            }
+        }
+        Ok(self)
+    }
+
+    async fn handle_key(self, code: KeyCode, mods: KeyModifiers) -> Result<Self> {
         if mods.contains(KeyModifiers::CONTROL) {
-            return self.handle_ctrl_key(code);
+            return self.handle_ctrl_key(code).await;
         }
 
-        // Mode-specific keybindings
         match self.mode {
-            Mode::Normal => self.handle_normal_key(code),
-            Mode::Insert => self.handle_insert_key(code),
-            Mode::Command => self.handle_command_key(code),
+            Mode::Normal => self.handle_normal_key(code).await,
+            Mode::Insert => self.handle_insert_key(code).await,
+            Mode::Command => self.handle_command_key(code).await,
         }
     }
 
-    // ═══════════════════════════════════════════════════════════════
-    // Mode: NORMAL
-    // ═══════════════════════════════════════════════════════════════
-
-    fn handle_normal_key(mut self, code: KeyCode) -> Result<Self> {
+    async fn handle_normal_key(mut self, code: KeyCode) -> Result<Self> {
         match code {
             KeyCode::Char('i') => {
                 self.mode = Mode::Insert;
@@ -113,11 +135,7 @@ impl App {
         Ok(self)
     }
 
-    // ═══════════════════════════════════════════════════════════════
-    // Mode: INSERT
-    // ═══════════════════════════════════════════════════════════════
-
-    fn handle_insert_key(mut self, code: KeyCode) -> Result<Self> {
+    async fn handle_insert_key(mut self, code: KeyCode) -> Result<Self> {
         match code {
             KeyCode::Esc => {
                 self.mode = Mode::Normal;
@@ -126,7 +144,8 @@ impl App {
             KeyCode::Enter => {
                 let input = self.input_buffer.content().to_string();
                 if !input.is_empty() {
-                    self.output = self.output
+                    self.output = self
+                        .output
                         .with_message(format!("→ {}", input))
                         .with_message(format!("← Echo: {}", input));
                     self.input_buffer = Buffer::new();
@@ -156,39 +175,34 @@ impl App {
         Ok(self)
     }
 
-    // ═══════════════════════════════════════════════════════════════
-    // Mode: COMMAND
-    // ═══════════════════════════════════════════════════════════════
-
-    fn handle_command_key(mut self, code: KeyCode) -> Result<Self> {
+    async fn handle_command_key(mut self, code: KeyCode) -> Result<Self> {
         match code {
             KeyCode::Esc => {
                 self.mode = Mode::Normal;
                 self.command_buffer = Buffer::new();
                 self.status = "Command cancelled".into();
+                Ok(self)
             }
             KeyCode::Enter => {
                 let cmd_text = self.command_buffer.content().to_string();
-                self = self.execute_command(&cmd_text)?;
-                self.mode = Mode::Normal;
-                self.command_buffer = Buffer::new();
+                let mut app = self.execute_command(&cmd_text).await?;
+                app.mode = Mode::Normal;
+                app.command_buffer = Buffer::new();
+                Ok(app)
             }
             KeyCode::Char(c) => {
                 self.command_buffer = self.command_buffer.insert_char(c);
+                Ok(self)
             }
             KeyCode::Backspace => {
                 self.command_buffer = self.command_buffer.delete_char();
+                Ok(self)
             }
-            _ => {}
+            _ => Ok(self),
         }
-        Ok(self)
     }
 
-    // ═══════════════════════════════════════════════════════════════
-    // Control key handlers
-    // ═══════════════════════════════════════════════════════════════
-
-    fn handle_ctrl_key(mut self, code: KeyCode) -> Result<Self> {
+    async fn handle_ctrl_key(mut self, code: KeyCode) -> Result<Self> {
         match code {
             KeyCode::Char('q') => {
                 self.quit = true;
@@ -206,11 +220,7 @@ impl App {
         Ok(self)
     }
 
-    // ═══════════════════════════════════════════════════════════════
-    // Command execution
-    // ═══════════════════════════════════════════════════════════════
-
-    fn execute_command(mut self, text: &str) -> Result<Self> {
+    async fn execute_command(mut self, text: &str) -> Result<Self> {
         match Command::parse(text) {
             Ok(Command::Quit) => {
                 self.quit = true;
@@ -227,11 +237,26 @@ impl App {
             Ok(Command::Help) => {
                 self.output = self.output
                     .with_message("Available commands:".to_string())
-                    .with_message("  :q, :quit     - Exit application".to_string())
-                    .with_message("  :clear        - Clear output".to_string())
-                    .with_message("  :echo <text>  - Echo text to output".to_string())
-                    .with_message("  :help         - Show this help".to_string());
+                    .with_message("  :q, :quit                - Exit application".to_string())
+                    .with_message("  :clear                   - Clear output".to_string())
+                    .with_message("  :echo <text>             - Echo text to output".to_string())
+                    .with_message("  :connect <url> <name>    - Connect to MCP server".to_string())
+                    .with_message("  :cn <url> <name>         - Alias for connect".to_string())
+                    .with_message("  :mcp list                - List configured MCP servers".to_string())
+                    .with_message("  :h, :help                - Show this help".to_string());
                 self.status = "Help displayed".into();
+            }
+            Ok(Command::Connect { url, name }) => {
+                self.status = format!("Connecting to {}...", url);
+                self.mcp_client.connect(url, name).await;
+            }
+            Ok(Command::McpList) => {
+                self.output = self.output.with_message("Configured MCP servers:".to_string());
+                for server in &self.config.mcp_servers {
+                    self.output = self
+                        .output
+                        .with_message(format!("  - {}: {}", server.name, server.url));
+                }
             }
             Err(e) => {
                 self.status = format!("Error: {}", e);
@@ -243,7 +268,7 @@ impl App {
 
 impl Default for App {
     fn default() -> Self {
-        Self::new()
+        let config = Config::from_file("config.json").unwrap();
+        Self::new(config)
     }
 }
-

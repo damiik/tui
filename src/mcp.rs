@@ -1,5 +1,72 @@
+use futures_util::StreamExt;
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use tokio::sync::mpsc;
+
+#[derive(Debug, Clone)]
+pub enum McpClientEvent {
+    Connected,
+    Disconnected,
+    Message(String),
+    Error(String),
+}
+
+#[derive(Debug)]
+pub struct McpClient {
+    event_tx: mpsc::Sender<McpClientEvent>,
+}
+
+impl McpClient {
+    pub fn new(event_tx: mpsc::Sender<McpClientEvent>) -> Self {
+        Self { event_tx }
+    }
+
+    pub async fn connect(&self, url: String, _server_name: String) {
+        let client = Client::new();
+        let event_tx = self.event_tx.clone();
+
+        tokio::spawn(async move {
+            match client.get(&url).send().await {
+                Ok(response) => {
+                    if !response.status().is_success() {
+                        let _ = event_tx
+                            .send(McpClientEvent::Error(format!(
+                                "Failed to connect: {}",
+                                response.status()
+                            )))
+                            .await;
+                        return;
+                    }
+
+                    let _ = event_tx.send(McpClientEvent::Connected).await;
+                    let mut stream = response.bytes_stream();
+
+                    while let Some(item) = stream.next().await {
+                        match item {
+                            Ok(bytes) => {
+                                let msg = String::from_utf8_lossy(&bytes).to_string();
+                                let _ = event_tx.send(McpClientEvent::Message(msg)).await;
+                            }
+                            Err(e) => {
+                                let _ = event_tx
+                                    .send(McpClientEvent::Error(format!("Stream error: {}", e)))
+                                    .await;
+                                break;
+                            }
+                        }
+                    }
+                    let _ = event_tx.send(McpClientEvent::Disconnected).await;
+                }
+                Err(e) => {
+                    let _ = event_tx
+                        .send(McpClientEvent::Error(format!("Connection error: {}", e)))
+                        .await;
+                }
+            }
+        });
+    }
+}
 
 /// MCP Protocol Message Types
 #[derive(Debug, Clone, Serialize, Deserialize)]

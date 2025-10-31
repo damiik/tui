@@ -1,0 +1,2615 @@
+--- file: mcp/handler.rs ---
+```rust
+// ============================================================================
+// src/mcp/handler.rs - FIXED
+// Updated with renamed select_netlist_comp_pin
+// ============================================================================ 
+
+use async_trait::async_trait;
+use rust_mcp_sdk::schema::{
+    schema_utils::CallToolError, CallToolRequest, CallToolResult,
+    ListToolsRequest, ListToolsResult, RpcError,
+};
+use rust_mcp_sdk::{mcp_server::ServerHandler, McpServer};
+use std::sync::Arc;
+use tokio::sync::{mpsc, RwLock};
+
+use crate::mcp::state::{PcbViCommand, PcbViState, SerializableAppState};
+use crate::mcp::tools::*;
+
+pub struct PcbViHandler {
+    command_tx: mpsc::Sender<PcbViCommand>,
+    state_rx: Arc<RwLock<mpsc::Receiver<PcbViState>>>,
+    current_state: Arc<RwLock<PcbViState>>,
+    app_state_req_tx: mpsc::Sender<()>, 
+    app_state_rx: Arc<RwLock<mpsc::Receiver<SerializableAppState>>>,
+}
+
+impl PcbViHandler {
+    pub async fn new(
+        command_tx: mpsc::Sender<PcbViCommand>,
+        state_rx: mpsc::Receiver<PcbViState>,
+        app_state_req_tx: mpsc::Sender<()>, 
+        app_state_rx: mpsc::Receiver<SerializableAppState>,
+    ) -> Self {
+        println!("\n🔬 PCBVi MCP Server Starting...");
+
+        let handler = Self {
+            command_tx,
+            state_rx: Arc::new(RwLock::new(state_rx)),
+            current_state: Arc::new(RwLock::new(PcbViState::default())),
+            app_state_req_tx,
+            app_state_rx: Arc::new(RwLock::new(app_state_rx)),
+        };
+        
+        // Start background task to receive state updates
+        let state_rx_clone = handler.state_rx.clone();
+        let current_state_clone = handler.current_state.clone();
+        tokio::spawn(async move {
+            loop {
+                let mut rx = state_rx_clone.write().await;
+                if let Some(state) = rx.recv().await {
+                    let mut current = current_state_clone.write().await;
+                    *current = state;
+                } else {
+                    break;
+                }
+            }
+        });
+        
+        handler
+    }
+
+    /// Send command to PCBVi application
+    pub async fn send_command(&self, command: PcbViCommand) -> Result<(), String> {
+        self.command_tx
+            .send(command)
+            .await
+            .map_err(|e| format!("Failed to send command: {}", e))
+    }
+
+    /// Get current state
+    pub async fn get_state(&self) -> PcbViState {
+        self.current_state.read().await.clone()
+    }
+
+    /// Get full serializable app state
+    pub async fn get_app_state(&self) -> Result<SerializableAppState, String> {
+        self.app_state_req_tx.send(()).await.map_err(|e| e.to_string())?;
+        let mut rx = self.app_state_rx.write().await;
+        rx.recv().await.ok_or_else(|| "Failed to receive app state".to_string())
+    }
+}
+
+#[async_trait]
+impl ServerHandler for PcbViHandler {
+    async fn on_initialized(&self, runtime: Arc<dyn McpServer>) {
+        let _ = runtime
+            .stderr_message(
+                "✅ PCBVi Control Server initialized.\n\
+                 \n\
+                 📋 SIDEBAR WORKFLOWS:\n\
+                 \n\
+                 SCENARIO A: Component → Pin → Netlist → Other Pins\n\
+                 1. search_components → select_component → select_pin\n\
+                 2. Netlist AUTO-selected, Comp.Pin list visible\n\
+                 3. select_netlist_comp_pin to jump between pins\n\
+                 \n\
+                 SCENARIO B: Netlist → Comp.Pin → Component\n\
+                 1. search_netlists → select_netlist\n\
+                 2. Comp.Pin list visible\n\
+                 3. select_netlist_comp_pin to pick component.pin\n\
+                 4. Component & pin AUTO-selected\n\
+                 \n\
+                 🎯 TOPOLOGY ANALYSIS (use BEFORE manual tracing):\n\
+                 • analyze_component_role - Is component worth tracing?\n\
+                 • analyze_net_role - Is net signal/power/ground?\n\
+                 • find_signal_path - Auto-filtered signal tracing\n\
+                 • list_routable_components - Filter components on net\n\
+                 • get_edges - Deep circuit context\n\
+                 \n\
+                 ⚠️ CRITICAL DISTINCTIONS:\n\
+                 • select_pin: Works on Pin List (after select_component)\n\
+                 • select_netlist_comp_pin: Works on Comp.Pin List (after select_netlist)\n\
+                 • Pin List ≠ Comp.Pin List!\n\
+                 \n\
+                 💡 ALWAYS follow workflow steps in order!"
+                    .to_string(),
+            )
+            .await;
+    }
+
+    async fn handle_list_tools_request(
+        &self,
+        _request: ListToolsRequest,
+        _runtime: Arc<dyn McpServer>,
+    ) -> std::result::Result<ListToolsResult, RpcError> {
+        Ok(ListToolsResult {
+            meta: None,
+            next_cursor: None,
+            tools: PcbViTools::tools(),
+        })
+    }
+
+    async fn handle_call_tool_request(
+        &self,
+        request: CallToolRequest,
+        _runtime: Arc<dyn McpServer>,
+    ) -> std::result::Result<CallToolResult, CallToolError> {
+        let tool_params: PcbViTools =
+            PcbViTools::try_from(request.params).map_err(CallToolError::new)?;
+
+        match tool_params {
+            // LAYER 1: Discovery
+            PcbViTools::GetViewState(tool) => tool.call_tool(&self).await,
+            PcbViTools::SearchComponents(tool) => tool.call_tool(&self).await,
+            PcbViTools::SearchNetlists(tool) => tool.call_tool(&self).await,
+            PcbViTools::GetComponentDetails(tool) => tool.call_tool(&self).await,
+            PcbViTools::GetNetlistDetails(tool) => tool.call_tool(&self).await,
+            PcbViTools::GetSidebarCompPins(tool) => tool.call_tool(&self).await,
+            
+            // LAYER 2: Topology
+            PcbViTools::AnalyzeComponentRole(tool) => tool.call_tool(&self).await,
+            PcbViTools::AnalyzeNetRole(tool) => tool.call_tool(&self).await,
+            PcbViTools::FindSignalPath(tool) => tool.call_tool(&self).await,
+            PcbViTools::ListRoutableComponents(tool) => tool.call_tool(&self).await,
+            
+            // LAYER 3: Selection & Navigation
+            PcbViTools::SelectComponent(tool) => tool.call_tool(&self).await,
+            PcbViTools::SelectPin(tool) => tool.call_tool(&self).await,
+            PcbViTools::SelectNetlist(tool) => tool.call_tool(&self).await,
+            PcbViTools::SelectNetlistCompPin(tool) => tool.call_tool(&self).await, // RENAMED!
+            PcbViTools::ClearFilters(tool) => tool.call_tool(&self).await,
+            PcbViTools::FilterCompPins(tool) => tool.call_tool(&self).await,
+            PcbViTools::SetZoom(tool) => tool.call_tool(&self).await,
+            PcbViTools::SetPan(tool) => tool.call_tool(&self).await,
+            PcbViTools::SetRotation(tool) => tool.call_tool(&self).await,
+            PcbViTools::SetLayer(tool) => tool.call_tool(&self).await,
+            PcbViTools::LoadFile(tool) => tool.call_tool(&self).await,
+            
+            // Advanced
+            PcbViTools::TraceNetFromPin(tool) => tool.call_tool(&self).await,
+            PcbViTools::BatchSelectSequence(tool) => tool.call_tool(&self).await,
+            PcbViTools::GetEdges(tool) => tool.call_tool(&self).await,
+        }
+    }
+}
+```
+
+--- file: mcp/mod.rs ---
+```rust
+// ============================================================================
+// src/pcbvi_mcp/mod.rs - MCP Server Integration for PCBVi
+// ============================================================================
+
+mod handler;
+mod tools;
+mod state;
+
+use handler::PcbViHandler;
+use rust_mcp_sdk::event_store::InMemoryEventStore;
+use rust_mcp_sdk::mcp_server::{hyper_server, HyperServerOptions};
+use rust_mcp_sdk::schema::{
+    Implementation, InitializeResult, ServerCapabilities, ServerCapabilitiesTools,
+    LATEST_PROTOCOL_VERSION,
+};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::mpsc;
+
+pub use state::{PcbViCommand, PcbViState, ComponentInfo, NetlistInfo, CompPinInfo, SerializableAppState};
+
+/// Uruchamia serwer MCP w osobnym zadaniu tokio
+/// Zwraca kanały do komunikacji dwukierunkowej
+/// Returns: (state_tx, command_rx, app_state_tx, app_state_req_rx)
+pub async fn start_mcp_server(
+    port: u16,
+) -> Result<(
+    mpsc::Sender<PcbViState>,
+    mpsc::Receiver<PcbViCommand>,
+    mpsc::Sender<SerializableAppState>,
+    mpsc::Receiver<()>
+), Box<dyn std::error::Error>> {
+    // Kanały komunikacyjne
+    let (command_tx, command_rx) = mpsc::channel::<PcbViCommand>(100);
+    let (state_tx, state_rx) = mpsc::channel::<PcbViState>(100);
+    let (app_state_tx, app_state_rx) = mpsc::channel::<SerializableAppState>(1);
+    let (app_state_req_tx, app_state_req_rx) = mpsc::channel::<()>(1);
+
+    let state_tx_clone = state_tx.clone();
+
+    // Uruchom serwer w osobnym zadaniu
+    tokio::spawn(async move {
+        if let Err(e) = run_server(port, command_tx, state_rx, app_state_req_tx, app_state_rx).await {
+            eprintln!("❌ MCP Server error: {}", e);
+        }
+    });
+
+    println!("🔌 MCP Server starting on port {}...", port);
+
+    Ok((state_tx_clone, command_rx, app_state_tx, app_state_req_rx))
+}
+
+async fn run_server(
+    port: u16,
+    command_tx: mpsc::Sender<PcbViCommand>,
+    state_rx: mpsc::Receiver<PcbViState>,
+    app_state_req_tx: mpsc::Sender<()>, 
+    app_state_rx: mpsc::Receiver<SerializableAppState>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let server_details = InitializeResult {
+        server_info: Implementation {
+            name: "pcbvi-mcp-server".to_string(),
+            version: "0.1.0".to_string(),
+            title: Some("PCBVi MCP Control Server".to_string()),
+        },
+        capabilities: ServerCapabilities {
+            tools: Some(ServerCapabilitiesTools { list_changed: None }),
+            ..Default::default()
+        },
+        meta: None,
+        instructions: Some(
+            "MCP server for controlling PCBVi board viewer application".to_string(),
+        ),
+        protocol_version: LATEST_PROTOCOL_VERSION.to_string(),
+    };
+
+    let handler = PcbViHandler::new(command_tx, state_rx, app_state_req_tx, app_state_rx).await;
+
+    let mut options = HyperServerOptions {
+        host: "127.0.0.1".to_string(),
+        ping_interval: Duration::from_secs(5),
+        event_store: Some(Arc::new(InMemoryEventStore::default())),
+        ..Default::default()
+    };
+    
+    // CRITICAL: Set port explicitly
+    options.port = port;
+
+    let server = hyper_server::create_server(server_details, handler, options);
+
+    server.start().await?;
+
+    Ok(())
+}
+```
+
+--- file: mcp/state.rs ---
+```rust
+// ============================================================================
+// src/pcbvi_mcp/state.rs - State management for MCP integration
+// ============================================================================
+
+use serde::{Deserialize, Serialize};
+
+/// Stan aplikacji PCBVi przesyłany do klienta MCP
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PcbViState {
+    pub components: Vec<ComponentInfo>,
+    pub netlists: Vec<NetlistInfo>,
+    pub comp_pins: Vec<CompPinInfo>,
+    pub selected_component: Option<usize>,
+    pub selected_pin: Option<usize>,
+    pub selected_netlist: Option<usize>,
+    pub current_layer: String,
+    pub available_layers: Vec<String>,
+    pub zoom: f32,
+    pub pan_x: f32,
+    pub pan_y: f32,
+    pub rotation: f32,
+    pub current_file: Option<String>,
+}
+
+impl Default for PcbViState {
+    fn default() -> Self {
+        Self {
+            components: Vec::new(),
+            netlists: Vec::new(),
+            comp_pins: Vec::new(),
+            selected_component: None,
+            selected_pin: None,
+            selected_netlist: None,
+            current_layer: "Top".to_string(),
+            available_layers: vec!["Top".to_string(), "Bottom".to_string()],
+            zoom: 1.0,
+            pan_x: 0.0,
+            pan_y: 0.0,
+            rotation: 0.0,
+            current_file: None,
+        }
+    }
+}
+
+/// Informacja o komponencie dla MCP
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComponentInfo {
+    pub id: usize,
+    pub designator: String,
+    pub value: String,
+    pub layer: String,
+    pub x: f32,
+    pub y: f32,
+    pub rotation: f32,
+    pub pin_count: usize,
+}
+
+/// Informacja o pinie dla MCP
+// #[derive(Debug, Clone, Serialize, Deserialize)]
+// pub struct PinInfo {
+//     pub component_id: usize,
+//     pub number: String,
+//     pub name: String,
+//     pub x: f32,
+//     pub y: f32,
+// }
+
+/// Informacja o netliście dla MCP
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetlistInfo {
+    pub id: usize,
+    pub name: String,
+    pub component_ids: Vec<usize>,
+    pub component_count: usize,
+}
+
+/// Informacja o Comp.Pin dla MCP
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompPinInfo {
+    pub component_id: usize,
+    pub component_designator: String,
+    pub pin_index: usize,
+    pub pin_number: String,
+    pub pin_name: String,
+    pub layer: String,
+}
+
+/// A single selection step in batch sequence
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct SelectionStep {
+    /// Component designator (e.g., "U6", "R10")
+    pub component: String,
+    /// Pin name (e.g., "+3V_TBTA_PDLDO", "VCC")
+    pub pin: String,
+}
+
+/// Komendy przesyłane z serwera MCP do aplikacji
+#[derive(Debug, Clone)]
+pub enum PcbViCommand {
+    // Selection commands
+    SelectComponent(usize),
+    DeselectComponent,
+    SelectPin { component_id: usize, pin_index: usize },
+    DeselectPin,
+    SelectNetlist(usize),
+    DeselectNetlist,
+    SelectCompPin { component_id: usize, pin_name: String },
+    // BatchSelectSequence { sequence: Vec<SelectionStep>, delay_ms: u64 },
+    FilterCompPins { query: String },
+    ClearFilters,
+
+    
+    // Navigation commands
+    SetZoom(f32),
+    SetPan { x: f32, y: f32 },
+    SetRotation(f32),
+    SetLayer(String),
+    
+    // File operations
+    LoadFile(String),
+    
+    // Query commands (return state immediately)
+    GetState,
+    GetComponents,
+    GetNetlists,
+    GetCompPins,
+    GetSerializableState, // NEW
+    //GetEdges { component: String, pin: String, max_depth: Option<u32> },
+}
+
+/// A serializable version of the core application state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SerializableAppState {
+    pub components: Vec<crate::pcb::Component>,
+    pub netlists: Vec<crate::pcb::Netlist>,
+}
+
+impl PcbViState {
+    /// Helper to extract component info from app state
+    pub fn from_app_state(
+        components: &[crate::pcb::Component],
+        netlists: &[crate::pcb::Netlist],
+        selected_component: Option<usize>,
+        selected_pin: Option<usize>,
+        selected_netlist: Option<usize>,
+        current_layer: &str,
+        available_layers: &[String],
+        zoom: f32,
+        pan_x: f32,
+        pan_y: f32,
+        rotation: f32,
+        current_file: &Option<String>,
+    ) -> Self {
+        let component_infos: Vec<ComponentInfo> = components
+            .iter()
+            .map(|c| ComponentInfo {
+                id: c.id,
+                designator: c.designator.clone(),
+                value: c.value.clone(),
+                layer: c.layer.clone(),
+                x: c.x,
+                y: c.y,
+                rotation: c.rotation,
+                pin_count: c.pins.len(),
+            })
+            .collect();
+
+        let netlists: Vec<NetlistInfo> = netlists
+            .iter()
+            .map(|n| NetlistInfo {
+                id: n.id,
+                name: n.name.clone(),
+                component_ids: n.component_ids.clone(),
+                component_count: n.component_ids.len(),
+            })
+            .collect();
+
+        // Generate Comp.Pin list from original components (not ComponentInfo)
+        let mut comp_pins = Vec::new();
+        for comp in components {
+            for (pin_idx, pin) in comp.pins.iter().enumerate() {
+                comp_pins.push(CompPinInfo {
+                    component_id: comp.id,
+                    component_designator: comp.designator.clone(),
+                    pin_index: pin_idx,
+                    pin_number: pin.number.clone(),
+                    pin_name: pin.name.clone(),
+                    layer: comp.layer.clone(),
+                });
+            }
+        }
+
+        Self {
+            components: component_infos,
+            netlists,
+            comp_pins,
+            selected_component,
+            selected_pin,
+            selected_netlist,
+            current_layer: current_layer.to_string(),
+            available_layers: available_layers.to_vec(),
+            zoom,
+            pan_x,
+            pan_y,
+            rotation,
+            current_file: current_file.clone(),
+        }
+    }
+}
+```
+
+--- file: mcp/tools/basic_tools.rs ---
+```rust
+use rust_mcp_sdk::schema::{schema_utils::CallToolError, CallToolResult, TextContent};
+use rust_mcp_sdk::macros::{mcp_tool, JsonSchema};
+use crate::mcp::handler::PcbViHandler;
+use crate::mcp::state::PcbViCommand;
+
+//*********************//
+//  SetZoom            //
+//*********************//
+#[mcp_tool(
+    name = "set_zoom",
+    description = "Sets the zoom level (0.1 to 1000.0)"
+)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
+pub struct SetZoom {
+    /// Zoom level (1.0 = 100%)
+    pub zoom: f32,
+}
+
+impl SetZoom {
+    pub async fn call_tool(&self, handler: &PcbViHandler) -> Result<CallToolResult, CallToolError> {
+        if self.zoom < 0.1 || self.zoom > 1000.0 {
+            return Err(CallToolError::from_message("Zoom must be between 0.1 and 1000.0"));
+        }
+        
+        handler.send_command(PcbViCommand::SetZoom(self.zoom)).await
+            .map_err(|e| CallToolError::from_message(e))?;
+        
+        Ok(CallToolResult::text_content(vec![
+            TextContent::from(format!("✅ Zoom set to {:.1}x", self.zoom))
+        ]))
+    }
+}
+
+//*********************//
+//  SetPan             //
+//*********************//
+#[mcp_tool(
+    name = "set_pan",
+    description = "Sets the pan position (world coordinates in meters)"
+)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
+pub struct SetPan {
+    pub x: f32,
+    pub y: f32,
+}
+
+impl SetPan {
+    pub async fn call_tool(&self, handler: &PcbViHandler) -> Result<CallToolResult, CallToolError> {
+        handler.send_command(PcbViCommand::SetPan { x: self.x, y: self.y }).await
+            .map_err(|e| CallToolError::from_message(e))?;
+        
+        Ok(CallToolResult::text_content(vec![
+            TextContent::from(format!("✅ Pan set to ({:.3}, {:.3})", self.x, self.y))
+        ]))
+    }
+}
+
+//*********************//
+//  SetRotation        //
+//*********************//
+#[mcp_tool(
+    name = "set_rotation",
+    description = "Sets the view rotation in degrees"
+)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
+pub struct SetRotation {
+    pub rotation: f32,
+}
+
+impl SetRotation {
+    pub async fn call_tool(&self, handler: &PcbViHandler) -> Result<CallToolResult, CallToolError> {
+        handler.send_command(PcbViCommand::SetRotation(self.rotation)).await
+            .map_err(|e| CallToolError::from_message(e))?;
+        
+        Ok(CallToolResult::text_content(vec![
+            TextContent::from(format!("✅ Rotation set to {:.0}°", self.rotation))
+        ]))
+    }
+}
+
+//*********************//
+//  SetLayer           //
+//*********************//
+#[mcp_tool(
+    name = "set_layer",
+    description = "Switches to a different PCB layer (Top, Bottom, Inner1, etc.)"
+)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
+pub struct SetLayer {
+    pub layer: String,
+}
+
+impl SetLayer {
+    pub async fn call_tool(&self, handler: &PcbViHandler) -> Result<CallToolResult, CallToolError> {
+        let state = handler.get_state().await;
+        
+        if !state.available_layers.contains(&self.layer) {
+            return Err(CallToolError::from_message(
+                format!("Layer not found: {}. Available: {:?}", self.layer, state.available_layers)
+            ));
+        }
+        
+        handler.send_command(PcbViCommand::SetLayer(self.layer.clone())).await
+            .map_err(|e| CallToolError::from_message(e))?;
+        
+        Ok(CallToolResult::text_content(vec![
+            TextContent::from(format!("✅ Switched to layer: {}", self.layer))
+        ]))
+    }
+}
+
+//*********************//
+//  LoadFile           //
+//*********************//
+#[mcp_tool(
+    name = "load_file",
+    description = "Loads a PCB board file (supports .fz, .brd, .bdv, .asc formats)"
+)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
+pub struct LoadFile {
+    pub path: String,
+}
+
+impl LoadFile {
+    pub async fn call_tool(&self, handler: &PcbViHandler) -> Result<CallToolResult, CallToolError> {
+        handler.send_command(PcbViCommand::LoadFile(self.path.clone())).await
+            .map_err(|e| CallToolError::from_message(e))?;
+        
+        Ok(CallToolResult::text_content(vec![
+            TextContent::from(format!("✅ Loading file: {}", self.path))
+        ]))
+    }
+}
+```
+
+--- file: mcp/tools/batch_select_sequence.rs ---
+```rust
+use rust_mcp_sdk::schema::{schema_utils::CallToolError, CallToolResult, TextContent};
+use rust_mcp_sdk::macros::{mcp_tool, JsonSchema};
+use crate::mcp::handler::PcbViHandler;
+use crate::mcp::state::PcbViCommand;
+
+//**********************//
+//  BatchSelectSequence //
+//*********************//
+// #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
+
+// pub struct SelectionStep {
+//     /// Component designator (e.g., "U6", "R10")
+//     pub component: String,
+//     /// Pin name (e.g., "+3V_TBTA_PDLDO", "VCC")
+//     pub pin: String,
+// }
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
+pub struct SelectionStep {
+    /// Component designator (e.g., "U6", "R10")
+    pub component: String,
+    /// Pin name (e.g., "+3V_TBTA_PDLDO", "VCC")
+    pub pin: String,
+}
+
+#[mcp_tool(
+    name = "batch_select_sequence",
+    description = "Sequentially selects multiple pins to show signal path. Each selection is applied immediately with visual feedback delay between items."
+)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
+pub struct BatchSelectSequence {
+    /// List of (component_designator, pin_name) pairs to select in order
+    /// Example: [("U6", "+3V_TBTA_PDLDO"), ("U7", "+3V_TBTA_PDLDO")]
+    pub sequence: Vec<SelectionStep>,
+    
+    /// Delay between selections in milliseconds (default: 500)
+    /// This controls visual feedback timing on the client side
+    pub delay_ms: Option<u32>,
+}
+
+impl BatchSelectSequence {
+    pub async fn call_tool(&self, handler: &PcbViHandler) -> Result<CallToolResult, CallToolError> {
+        let delay = std::time::Duration::from_millis(self.delay_ms.unwrap_or(500) as u64);
+        let mut results = Vec::new();
+        
+        // Validate all components exist before starting
+        let state = handler.get_state().await;
+        for step in &self.sequence {
+            if !state.components.iter().any(|c| c.designator.eq_ignore_ascii_case(step.component.as_str())) {
+                return Err(CallToolError::from_message(
+                    format!("Component '{}' not found. Aborting batch sequence.", step.component)
+                ));
+            }
+        }
+        
+        // Process each item with delay
+        for (i, step ) in self.sequence.iter().enumerate() {
+            let state = handler.get_state().await;
+            
+            // Find component ID
+            let comp_id = state.components.iter()
+                .find(|c| c.designator.eq_ignore_ascii_case(step.component.as_str()))
+                .map(|c| c.id)
+                .ok_or_else(|| CallToolError::from_message(
+                    format!("Component '{}' not found", step.component)
+                ))?;
+            
+            // Switch layer if needed (send separate command)
+            if let Some(c) = state.components.iter().find(|c| c.id == comp_id) {
+                if c.layer != state.current_layer {
+                    handler.send_command(PcbViCommand::SetLayer(c.layer.clone())).await
+                        .map_err(|e| CallToolError::from_message(e.clone()))?;
+                    
+                    // Small delay after layer switch for visual feedback
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+            }
+            
+            // Select pin
+            handler.send_command(PcbViCommand::SelectCompPin {
+                component_id: comp_id,
+                pin_name: step.pin.clone(),
+            }).await.map_err(|e| CallToolError::from_message(e.clone()))?;
+            
+            results.push(format!("{}. {} → {}", i + 1, step.component, step.pin));
+            
+            // Delay before next selection (except last)
+            if i < self.sequence.len() - 1 {
+                tokio::time::sleep(delay).await;
+            }
+        }
+        
+        Ok(CallToolResult::text_content(vec![
+            TextContent::from(format!(
+                "🔄 Sequential selection complete ({} items):\n{}", 
+                results.len(), 
+                results.join("\n")
+            ))
+        ]))
+    }
+}
+
+```
+
+--- file: mcp/tools/get_edges.rs ---
+```rust
+use std::collections::{HashSet, VecDeque};
+use rust_mcp_sdk::schema::{schema_utils::CallToolError, CallToolResult, TextContent};
+use rust_mcp_sdk::macros::{mcp_tool, JsonSchema};
+use crate::mcp::handler::PcbViHandler;
+
+//***************************//
+//  GetEdges                 //
+//***************************//
+
+#[mcp_tool(
+    name = "get_edges",
+    description = "Returns recursive circuit context (surrounding components and connections) starting from a specific pin. Explores all connected netlists except GND and (NC), building a complete subgraph of the circuit. Perfect for understanding power distribution, signal paths, and component relationships."
+)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
+pub struct GetEdges {
+    /// Component designator (e.g., 'PJ1801')
+    pub component: String,
+    /// Pin number or name (e.g., '1', '+1.8VALWP')
+    pub pin: String,
+    /// Maximum recursion depth (default: 10, prevents infinite loops)
+    pub max_depth: Option<u32>,
+    /// Maximum pins per net before stopping exploration (default: 20, prevents fanout explosion)
+    pub max_fanout: Option<u32>,
+}
+
+/// A single edge in the circuit graph: component.pin -> netlist
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
+pub struct Edge {
+    /// Component.Pin identifier (e.g., "PJ1801.1")
+    pub node: String,
+    /// Netlist name this pin connects to
+    pub net: String,
+}
+
+impl GetEdges {
+    pub async fn call_tool(&self, handler: &PcbViHandler) -> Result<CallToolResult, CallToolError> {
+        println!("🔗 GetEdges: Starting analysis for {}.{}", self.component, self.pin);
+        
+        let app_state = handler.get_app_state().await
+            .map_err(|e| CallToolError::from_message(format!("Failed to get app state: {}", e)))?;
+
+        // Find starting component
+        let start_component = app_state.components.iter()
+            .find(|c| c.designator.eq_ignore_ascii_case(&self.component))
+            .ok_or_else(|| CallToolError::from_message(format!("Component '{}' not found", self.component)))?;
+
+        // Find starting pin
+        let start_pin = start_component.pins.iter()
+            .find(|p| p.name.eq_ignore_ascii_case(&self.pin) || p.number == self.pin)
+            .ok_or_else(|| CallToolError::from_message(format!("Pin '{}' not found on {}", self.pin, self.component)))?;
+
+        // Get starting netlist
+        let start_net_name = if let Some(net_id) = start_pin.net_id {
+            app_state.netlists.iter()
+                .find(|n| n.id == net_id)
+                .map(|n| n.name.clone())
+                .ok_or_else(|| CallToolError::from_message("Starting net not found"))?
+        } else {
+            // Fallback: use pin name as net name (boardview convention)
+            app_state.netlists.iter()
+                .find(|n| n.name.eq_ignore_ascii_case(&start_pin.name))
+                .map(|n| n.name.clone())
+                .ok_or_else(|| CallToolError::from_message(
+                    format!("Pin {}.{} has no netlist connection", self.component, self.pin)
+                ))?
+        };
+
+        let max_depth = self.max_depth.unwrap_or(5);
+        let max_fanout = self.max_fanout.unwrap_or(20);
+        
+        // Run BFS to collect all edges
+        let edges = self.collect_edges(&app_state, &start_net_name, max_depth, max_fanout);
+
+        // Format output
+        let edge_tuples: Vec<(String, String)> = edges.iter()
+            .map(|e| (e.node.clone(), e.net.clone()))
+            .collect();
+
+        let result = serde_json::json!({
+            "start_component": self.component,
+            "start_pin": self.pin,
+            "start_net": start_net_name,
+            "total_edges": edges.len(),
+            "max_depth_reached": max_depth,
+            "edges": edge_tuples
+        });
+
+        let output = serde_json::to_string_pretty(&result)
+            .map_err(|e| CallToolError::from_message(format!("Serialization error: {}", e)))?;
+
+        Ok(CallToolResult::text_content(vec![
+            TextContent::from(format!(
+                "🔗 Circuit Edges from {}.{} (net: {})\n\
+                 Found {} connections across {} components\n\n{}",
+                self.component, self.pin, start_net_name,
+                edges.len(),
+                edges.iter().map(|e| e.node.split('.').next().unwrap()).collect::<HashSet<_>>().len(),
+                output
+            ))
+        ]))
+    }
+
+    /// Collect all edges using BFS traversal
+    fn collect_edges(
+        &self,
+        app_state: &crate::mcp::SerializableAppState,
+        start_net: &str,
+        max_depth: u32,
+        max_fanout: u32,
+    ) -> Vec<Edge> {
+        println!("🔍 BFS: Starting traversal from net '{}'", start_net);
+        
+        let mut edges = Vec::new();
+        let mut visited_nets: HashSet<String> = HashSet::new();
+        let mut visited_components: HashSet<(String, String)> = HashSet::new(); // (component, pin_number)
+        let mut queue: VecDeque<(String, u32)> = VecDeque::new(); // (net_name, depth)
+        let mut net_stats: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut blocked_nets: HashSet<String> = HashSet::new(); // Nets blocked due to fanout
+
+        // Start BFS from initial net
+        queue.push_back((start_net.to_string(), 0));
+        visited_nets.insert(start_net.to_string());
+
+        while let Some((current_net, depth)) = queue.pop_front() {
+            if depth >= max_depth {
+                continue;
+            }
+
+            // Skip GND - we don't explore further from ground and NC nets
+            if current_net.eq_ignore_ascii_case("GND") || current_net.eq_ignore_ascii_case("(NC)") {
+                continue;
+            }
+
+            // Skip NC (Not Connected) - prevents explosion across unrelated circuits
+            if current_net.eq_ignore_ascii_case("NC") || 
+               current_net.eq_ignore_ascii_case("N/C") ||
+               current_net.starts_with("NC_") {
+                println!("  🛑 Hit NC pin '{}' at depth {} - unconnected net", 
+                    current_net, depth);
+                continue;
+            }
+
+            // Check fanout BEFORE processing to prevent explosion
+            let pin_count = self.count_pins_on_net(app_state, &current_net);
+            if pin_count > max_fanout as usize {
+                blocked_nets.insert(current_net.clone());
+                println!("  🚫  Blocking '{}' (fanout {} > max {}) - high-fanout net (bus/power plane)", 
+                     current_net, pin_count, max_fanout);
+                continue;
+            }
+
+            println!("  🔄 Processing net '{}' at depth {} (fanout: {})", 
+                current_net, depth, pin_count);
+
+            let mut components_found = 0;
+            let mut pins_found = 0;
+            let mut new_nets_discovered = Vec::new();
+
+            // Find all components connected to this net
+            for component in &app_state.components {
+                let mut component_has_pins_on_net = false;
+                
+                for pin in &component.pins {
+                    // Check if pin is on current net
+                    let is_on_net = pin.net_id
+                        .and_then(|id| app_state.netlists.iter().find(|n| n.id == id))
+                        .map(|n| n.name.eq_ignore_ascii_case(&current_net))
+                        .unwrap_or_else(|| pin.name.eq_ignore_ascii_case(&current_net));
+
+                    if !is_on_net {
+                        continue;
+                    }
+
+                    if !component_has_pins_on_net {
+                        components_found += 1;
+                        component_has_pins_on_net = true;
+                    }
+                    pins_found += 1;
+
+                    // Create edge for this pin
+                    let node = format!("{}.{}", component.designator, pin.number);
+                    let comp_pin_key = (component.designator.clone(), pin.number.clone());
+                    println!("  -> {}.{}", component.designator, pin.number);
+
+                    // Avoid duplicate edges
+                    if visited_components.contains(&comp_pin_key) {
+                        continue;
+                    }
+                    visited_components.insert(comp_pin_key);
+
+                    edges.push(Edge {
+                        node: node.clone(),
+                        net: current_net.clone(),
+                    });
+
+                    // Explore other pins on same component (to discover new nets)
+                    for other_pin in &component.pins {
+                        if other_pin.number == pin.number {
+                            continue; // Skip same pin
+                        }
+
+                        // Get net name for other pin
+                        let other_net_name = if let Some(net_id) = other_pin.net_id {
+                            app_state.netlists.iter()
+                                .find(|n| n.id == net_id)
+                                .map(|n| n.name.clone())
+                        } else {
+                            app_state.netlists.iter()
+                                .find(|n| n.name.eq_ignore_ascii_case(&other_pin.name))
+                                .map(|n| n.name.clone())
+                        };
+
+                        if let Some(other_net) = other_net_name {
+                            // Skip if already visited or blocked
+                            if visited_nets.contains(&other_net) || blocked_nets.contains(&other_net) {
+                                continue;
+                            }
+                            
+                            // Pre-check fanout before adding to queue
+                            let other_net_fanout = self.count_pins_on_net(app_state, &other_net);
+                            
+                            if other_net_fanout > max_fanout as usize {
+                                blocked_nets.insert(other_net.clone());
+                                println!("    🚫 Pre-blocking '{}' (fanout {} > max {})", 
+                                    other_net, other_net_fanout, max_fanout);
+                                continue;
+                            }
+                            
+                            // Add this net to exploration queue if not visited
+                                visited_nets.insert(other_net.clone());
+                            queue.push_back((other_net.clone(), depth + 1));
+                            new_nets_discovered.push(other_net);
+                        }
+                    }
+                }
+            }
+
+            *net_stats.entry(current_net.clone()).or_insert(0) += pins_found;
+
+            println!("    ✅ Found {} components with {} pins on '{}'", 
+                components_found, pins_found, current_net);
+            
+            if !new_nets_discovered.is_empty() {
+                let display_count = new_nets_discovered.len().min(3);
+                println!("    🆕 Discovered {} new nets: {:?}", 
+                    new_nets_discovered.len(), 
+                    &new_nets_discovered[..display_count]);
+                if new_nets_discovered.len() > 3 {
+                    println!("       ... and {} more", new_nets_discovered.len() - 3);
+                }
+            }
+            
+            println!("    📊 Queue: {}, Edges: {}, Blocked: {}", 
+                queue.len(), edges.len(), blocked_nets.len());
+        }
+
+        // Final statistics
+        println!();
+        println!("  ✅ BFS Complete:");
+        println!("     - Nets explored: {}", visited_nets.len());
+        println!("     - Nets blocked: {} (high fanout or NC)", blocked_nets.len());
+        println!("     - Components visited: {}", 
+            visited_components.iter().map(|(c, _)| c).collect::<HashSet<_>>().len());
+        println!("     - Total edges: {}", edges.len());
+        
+        if !blocked_nets.is_empty() {
+            println!("  🚫 Blocked nets (fanout > {}):", max_fanout);
+            let mut blocked_vec: Vec<_> = blocked_nets.iter().collect();
+            blocked_vec.sort();
+            for net in blocked_vec.iter().take(5) {
+                let count = self.count_pins_on_net(app_state, net);
+                println!("     - {}: {} pins", net, count);
+            }
+            if blocked_nets.len() > 5 {
+                println!("     ... and {} more", blocked_nets.len() - 5);
+            }
+        }
+        
+        println!("  🔝 Top nets by pin count:");
+        let mut net_vec: Vec<_> = net_stats.iter().collect();
+        net_vec.sort_by(|a, b| b.1.cmp(a.1));
+        for (net, count) in net_vec.iter().take(5) {
+            println!("     - {}: {} pins", net, count);
+        }
+
+        // Sort edges for consistent output
+        edges.sort_by(|a, b| {
+            a.node.cmp(&b.node).then(a.net.cmp(&b.net))
+        });
+
+        edges
+    }
+
+    /// Count how many pins are connected to a specific net
+    fn count_pins_on_net(&self, app_state: &crate::mcp::SerializableAppState, net_name: &str) -> usize {
+        let mut count = 0;
+        for component in &app_state.components {
+            for pin in &component.pins {
+                let is_on_net = pin.net_id
+                    .and_then(|id| app_state.netlists.iter().find(|n| n.id == id))
+                    .map(|n| n.name.eq_ignore_ascii_case(net_name))
+                    .unwrap_or_else(|| pin.name.eq_ignore_ascii_case(net_name));
+                
+                if is_on_net {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+}
+```
+
+--- file: mcp/tools/get_search_tools.rs ---
+```rust
+// ============================================================================
+// src/mcp/tools/get_search_tools.rs - REFACTORED
+// Lightweight discovery tools - NO topology analysis here
+// ============================================================================
+
+use rust_mcp_sdk::schema::{schema_utils::CallToolError, CallToolResult, TextContent};
+use rust_mcp_sdk::macros::{mcp_tool, JsonSchema};
+use crate::mcp::handler::PcbViHandler;
+
+//******************//
+//  GetViewState    //
+//******************//
+
+#[mcp_tool(
+    name = "get_view_state",
+    description = "Returns current UI state: what component/pin/netlist is selected, current layer, zoom, pan. Use to check sidebar state before issuing commands."
+)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
+pub struct GetViewState {}
+
+impl GetViewState {
+    pub async fn call_tool(&self, handler: &PcbViHandler) -> Result<CallToolResult, CallToolError> {
+        let state = handler.get_state().await;
+        
+        let view_info = serde_json::json!({
+            "selected_component_id": state.selected_component,
+            "selected_pin_index": state.selected_pin,
+            "selected_netlist_id": state.selected_netlist,
+            "current_layer": state.current_layer,
+            "available_layers": state.available_layers,
+            "zoom": state.zoom,
+            "pan": [state.pan_x, state.pan_y],
+            "rotation": state.rotation,
+            "current_file": state.current_file,
+            "board_stats": {
+            "total_components": state.components.len(),
+            "total_netlists": state.netlists.len(),
+                "total_comp_pins": state.comp_pins.len()
+            }
+        });
+        
+        let output = serde_json::to_string_pretty(&view_info)
+            .map_err(|e| CallToolError::from_message(format!("Serialization error: {}", e)))?;
+        
+        Ok(CallToolResult::text_content(vec![
+            TextContent::from(format!("📊 Current UI State\n{}", output))
+        ]))
+    }
+}
+
+//*********************//
+//  SearchComponents   //
+//*********************//
+
+#[mcp_tool(
+    name = "search_components",
+    description = "SCENARIO A STEP 1: Searches components by designator pattern and populates sidebar's component list. Use wildcards: 'U*' (all ICs), 'PR*' (resistors with P prefix), 'C10*' (caps starting with C10). Results appear in sidebar - use select_component to pick one."
+)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
+pub struct SearchComponents {
+    /// Search pattern with wildcards (e.g., 'U6', 'PR*', 'C1*', '*SENSOR*')
+    pub query: String,
+    /// Maximum results to return (default: 20, max: 100)
+    pub limit: Option<u32>,
+}
+
+impl SearchComponents {
+    pub async fn call_tool(&self, handler: &PcbViHandler) -> Result<CallToolResult, CallToolError> {
+        let state = handler.get_state().await;
+        let limit = self.limit.unwrap_or(20).min(100);
+        
+        let query_upper = self.query.to_uppercase();
+        let is_wildcard = query_upper.contains('*');
+        
+        let matches: Vec<_> = state.components.iter()
+            .filter(|c| {
+                let designator_upper = c.designator.to_uppercase();
+                if is_wildcard {
+                    let pattern = query_upper.replace('*', "");
+                    if query_upper.starts_with('*') && query_upper.ends_with('*') {
+                        designator_upper.contains(&pattern)
+                    } else if query_upper.starts_with('*') {
+                        designator_upper.ends_with(&pattern)
+                    } else if query_upper.ends_with('*') {
+                        designator_upper.starts_with(&pattern)
+                    } else {
+                        designator_upper.contains(&pattern)
+                    }
+                } else {
+                    designator_upper == query_upper
+                }
+            })
+            .take(limit as usize)
+            .collect();
+        
+        if matches.is_empty() {
+            return Ok(CallToolResult::text_content(vec![
+                TextContent::from(format!(
+                    "❌ No components found matching '{}'\n\
+                     💡 Try: 'U*' (ICs), 'PR*' (resistors), 'PC*' (capacitors)\n\
+                     💡 Remember: many boards use some letter prefix (e.g., 'P' -> PC1043 = C1043)",
+                    self.query
+                ))
+            ]));
+        }
+        
+        // MINIMAL output - just enough for selection
+        let results: Vec<_> = matches.iter().map(|c| {
+            serde_json::json!({
+                "id": c.id,
+                "designator": c.designator,
+                "value": c.value,
+                "layer": c.layer,
+                "pin_count": c.pin_count,
+            })
+        }).collect();
+        
+        let output = serde_json::to_string_pretty(&results)
+            .map_err(|e| CallToolError::from_message(format!("Serialization error: {}", e)))?;
+        
+        Ok(CallToolResult::text_content(vec![
+            TextContent::from(format!(
+                "✅ Found {} components matching '{}'\n{}\n\n\
+                 📋 Results now visible in sidebar's component list\n\
+                 👉 SCENARIO A STEP 2: Use select_component to pick one",
+                matches.len(), self.query, output
+            ))
+        ]))
+    }
+}
+
+//*******************//
+//  SearchNetlists   //
+//*******************//
+
+#[mcp_tool(
+    name = "search_netlists",
+    description = "SCENARIO B STEP 1: Searches netlists by name pattern and populates sidebar's netlist list. Use wildcards: '+3V*' (all 3V rails), 'I2C*' (I2C signals), 'GND' (ground). Results appear in sidebar - use select_netlist to pick one."
+)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
+pub struct SearchNetlists {
+    /// Search pattern with wildcards (e.g., 'VCC', '+3V*', 'I2C*', '*_SDA')
+    pub query: String,
+    /// Maximum results to return (default: 20, max: 100)
+    pub limit: Option<u32>,
+}
+
+impl SearchNetlists {
+    pub async fn call_tool(&self, handler: &PcbViHandler) -> Result<CallToolResult, CallToolError> {
+        let state = handler.get_state().await;
+        let limit = self.limit.unwrap_or(20).min(100);
+        
+        let query_upper = self.query.to_uppercase();
+        let is_wildcard = query_upper.contains('*');
+        
+        let matches: Vec<_> = state.netlists.iter()
+            .filter(|n| {
+                let name_upper = n.name.to_uppercase();
+                if is_wildcard {
+                    let pattern = query_upper.replace('*', "");
+                    if query_upper.starts_with('*') && query_upper.ends_with('*') {
+                        name_upper.contains(&pattern)
+                    } else if query_upper.starts_with('*') {
+                        name_upper.ends_with(&pattern)
+                    } else if query_upper.ends_with('*') {
+                        name_upper.starts_with(&pattern)
+                    } else {
+                        name_upper.contains(&pattern)
+                    }
+                } else {
+                    name_upper == query_upper
+                }
+            })
+            .take(limit as usize)
+            .collect();
+        
+        if matches.is_empty() {
+            return Ok(CallToolResult::text_content(vec![
+                TextContent::from(format!(
+                    "❌ No netlists found matching '{}'\n\
+                     💡 Try: '+3V*', 'I2C*', 'USB*', 'CLK*'",
+                    self.query
+                ))
+            ]));
+        }
+        
+        // MINIMAL output
+        let results: Vec<_> = matches.iter().map(|n| {
+            serde_json::json!({
+                "id": n.id,
+                "name": n.name,
+                "component_count": n.component_count,
+            })
+        }).collect();
+        
+        let output = serde_json::to_string_pretty(&results)
+            .map_err(|e| CallToolError::from_message(format!("Serialization error: {}", e)))?;
+        
+        Ok(CallToolResult::text_content(vec![
+            TextContent::from(format!(
+                "✅ Found {} netlists matching '{}'\n{}\n\n\
+                 📋 Results now visible in sidebar's netlist list\n\
+                 👉 SCENARIO B STEP 2: Use select_netlist to pick one",
+                matches.len(), self.query, output
+            ))
+        ]))
+    }
+}
+
+//*************************//
+//  GetComponentDetails    //
+//*************************//
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
+pub struct ComponentDetails {
+    pub id: u32,
+    pub designator: String,
+    pub value: String,
+    pub layer: String,
+    pub x: f32,
+    pub y: f32,
+    pub rotation: f32,
+    pub pins: Vec<PinDetails>,
+    pub inferred_type: String, // NEW: "resistor", "capacitor", "ic", "unknown"
+}
+
+/// Detailed information about a single pin.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
+pub struct PinDetails {
+    pub number: String,
+    pub name: String,
+    pub net_id: Option<u32>,
+    pub net_name: Option<String>,
+}
+
+#[mcp_tool(
+    name = "get_component_details",
+    description = "Returns FULL details for ONE component including all pins with their nets. Use to see complete pin mapping. Pin index from this output is needed for select_pin. Use SPARINGLY - prefer topology tools for analysis."
+)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
+pub struct GetComponentDetails {
+    /// The designator of the component to retrieve (e.g., 'U1', 'R10').
+    pub designator: String,
+}
+
+impl GetComponentDetails {
+    pub async fn call_tool(&self, handler: &PcbViHandler) -> Result<CallToolResult, CallToolError> {
+        let app_state = handler.get_app_state().await
+            .map_err(|e| CallToolError::from_message(format!("Failed to get app state: {}", e)))?;
+
+        let component = app_state.components.iter()
+            .find(|c| c.designator.eq_ignore_ascii_case(&self.designator))
+            .ok_or_else(|| CallToolError::from_message(format!("Component '{}' not found. Use search_components first.", self.designator)))?;
+
+        let pin_details: Vec<PinDetails> = component.pins.iter().enumerate().map(|(idx, pin)| {
+            let (net_id, net_name) = if let Some(id) = pin.net_id {
+                match app_state.netlists.iter().find(|n| n.id == id) {
+                    Some(netlist) => (Some(id as u32), Some(netlist.name.clone())),
+                    None => (Some(id as u32), None),
+                }
+            } else {
+                // Fallback: use pin name as net name (boardview convention)
+                match app_state.netlists.iter().find(|n| n.name.eq_ignore_ascii_case(&pin.name)) {
+                    Some(netlist) => (Some(netlist.id as u32), Some(netlist.name.clone())),
+                    None => (None, None),
+                }
+            };
+
+            PinDetails {
+                number: pin.number.clone(),
+                name: pin.name.clone(),
+                net_id,
+                net_name: net_name.or(Some(pin.name.clone())),
+            }
+        }).collect();
+
+        let component_details = ComponentDetails {
+            id: component.id as u32,
+            designator: component.designator.clone(),
+            value: component.value.clone(),
+            layer: component.layer.clone(),
+            x: component.x,
+            y: component.y,
+            rotation: component.rotation,
+            pins: pin_details,
+            inferred_type: Self::infer_component_type(&component.designator, component.pins.len()),
+        };
+
+        let output = serde_json::to_string_pretty(&component_details)
+            .map_err(|e| CallToolError::from_message(format!("Serialization error: {}", e)))?;
+
+        Ok(CallToolResult::text_content(vec![
+            TextContent::from(format!(
+                "📦 Component Details for {}\n{}\n\n\
+                 💡 Pin indices (0-based) shown above - use with select_pin\n\
+                 💡 For topology analysis, prefer analyze_component_role or find_signal_path",
+                self.designator, output
+            ))
+        ]))
+    }
+    
+    fn infer_component_type(designator: &str, pin_count: usize) -> String {
+        let upper = designator.to_uppercase();
+       let px: &[_] = &['A', 'B', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'M', 'N', 'O', 'P', 'S', 'T', 'V', 'W', 'X', 'Y', 'Z']; 
+
+        // Strip common prefixes (P, PR, etc.)
+        let stripped = upper.trim_start_matches(px);
+        
+        if stripped.starts_with('R') && pin_count == 2 {
+            "resistor".to_string()
+        } else if stripped.starts_with('C') && pin_count == 2 {
+            "capacitor".to_string()
+        } else if stripped.starts_with('L') && pin_count == 2 {
+            "inductor".to_string()
+        } else if stripped.starts_with('D') {
+            "diode".to_string()
+        } else if stripped.starts_with('Q') && pin_count >= 3 {
+            "transistor".to_string()
+        } else if stripped.starts_with('U') || pin_count > 4 {
+            "ic".to_string()
+        } else {
+            "unknown".to_string()
+        }
+    }
+}
+
+//***********************//
+//  GetNetlistDetails    //
+//***********************//
+
+/// Detailed information about a single netlist, including all connected pins.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
+pub struct NetlistDetails {
+    pub id: u32,
+    pub name: String,
+    pub connected_pins: Vec<ConnectedPinInfo>,
+    pub inferred_role: String,
+}
+
+/// Information about a pin connected to a netlist.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
+pub struct ConnectedPinInfo {
+    pub component_id: u32,
+    pub component_designator: String,
+    pub component_value: String,
+    pub component_layer: String,
+    pub pin_number: String,
+    pub pin_name: String,
+    pub cross_layer: bool, // Indicates if the pin is on a different layer than the current layer
+}
+
+#[mcp_tool(
+    name = "get_netlist_details",
+    description = "Returns FULL details for ONE netlist including ALL connected component.pin entries. Use to see complete connection list. Use SPARINGLY - this can return hundreds of pins for power/ground nets. Prefer list_routable_components or topology tools."
+)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
+pub struct GetNetlistDetails {
+    /// Netlist name (e.g., 'VCC', 'I2C_SDA', '+3V_MAIN')
+    pub name: String,
+}
+
+impl GetNetlistDetails {
+    pub async fn call_tool(&self, handler: &PcbViHandler) -> Result<CallToolResult, CallToolError> {
+        let app_state = handler.get_app_state().await
+            .map_err(|e| CallToolError::from_message(format!("Failed to get app state: {}", e)))?;
+
+        let netlist = app_state.netlists.iter()
+            .find(|n| n.name.eq_ignore_ascii_case(&self.name))
+            .ok_or_else(|| CallToolError::from_message(format!("Netlist '{}' not found. Use search_netlists first.", self.name)))?;
+
+        let mut connected_pins = Vec::new();
+        
+        for component in &app_state.components {
+            if netlist.component_ids.contains(&component.id) {
+                for pin in &component.pins {
+                    // FIXED: Match by net_id OR pin name (boardview often uses pin name as net name)
+                    let is_connected = pin.net_id == Some(netlist.id) 
+                        || pin.name.eq_ignore_ascii_case(&netlist.name);
+                    
+                    if is_connected {
+                        connected_pins.push(ConnectedPinInfo {
+                            component_id: component.id as u32,
+                            component_designator: component.designator.clone(),
+                            component_value: component.value.clone(),
+                            component_layer: component.layer.clone(),
+                            pin_number: pin.number.clone(),
+                            pin_name: pin.name.clone(),
+                            cross_layer: component.layer != handler.get_state().await.current_layer, 
+                        });
+                    }
+                }
+            }
+        }
+
+        if connected_pins.len() > 50 {
+            return Ok(CallToolResult::text_content(vec![
+                TextContent::from(format!(
+                    "⚠️ Netlist '{}' has {} connections - TOO MANY for detailed view!\n\
+                     💡 Instead use:\n\
+                     - list_routable_components('{}') - shows only signal-routing components\n\
+                     - select_netlist('{}') then filter_comp_pins('U*') - filter in sidebar\n\
+                     - analyze_net_role('{}') - check if it's power/ground/signal",
+                    self.name, connected_pins.len(), self.name, self.name, self.name
+                ))
+            ]));
+        }
+
+        let netlist_details = NetlistDetails {
+            id: netlist.id as u32,
+            name: netlist.name.clone(),
+            connected_pins,
+            inferred_role: Self::infer_net_role(&netlist.name),
+        };
+
+        let output = serde_json::to_string_pretty(&netlist_details)
+            .map_err(|e| CallToolError::from_message(format!("Serialization error: {}", e)))?;
+
+        Ok(CallToolResult::text_content(vec![
+            TextContent::from(format!(
+                "🔗 Netlist Details for {}\n{}\n\n\
+                 💡 For topology analysis, prefer analyze_net_role or find_signal_path",
+                self.name, output
+            ))
+        ]))
+    }
+    
+    fn infer_net_role(name: &str) -> String {
+        let upper = name.to_uppercase();
+        
+        if upper.contains("GND") || upper.contains("VSS") {
+            "ground".to_string()
+        } else if upper.contains("VCC") || upper.contains("VDD") || upper.starts_with("+") || upper.starts_with("-") {
+            "power".to_string()
+        } else if upper.contains("NC") || upper.starts_with("(NC)") {
+            "nc".to_string()
+        } else {
+            "signal".to_string()
+        }
+    }
+}
+
+//***************************//
+//  GetSidebarCompPins       //
+//***************************//
+
+#[mcp_tool(
+    name = "get_sidebar_comp_pins",
+    description = "Returns Comp.Pin list currently visible in sidebar (requires netlist to be selected). Use to see what component.pin entries are available for selection. This mimics what user sees in sidebar's Comp.Pin section."
+)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
+pub struct GetSidebarCompPins {}
+
+impl GetSidebarCompPins {
+    pub async fn call_tool(&self, handler: &PcbViHandler) -> Result<CallToolResult, CallToolError> {
+        let state = handler.get_state().await;
+        
+        let selected_netlist_id = state.selected_netlist
+            .ok_or_else(|| CallToolError::from_message(
+                "No netlist selected. WORKFLOW ERROR: Use select_netlist first to populate Comp.Pin list."
+            ))?;
+        
+        let netlist = state.netlists.iter()
+            .find(|n| n.id == selected_netlist_id)
+            .ok_or_else(|| CallToolError::from_message("Selected netlist not found"))?;
+        
+        // Filter comp_pins for this netlist
+        let comp_pins: Vec<_> = state.comp_pins.iter()
+            .filter(|cp| cp.pin_name == netlist.name)
+            .map(|cp| serde_json::json!({
+                "component_id": cp.component_id,
+                "component_designator": cp.component_designator,
+                "pin_index": cp.pin_index,
+                "pin_number": cp.pin_number,
+                "pin_name": cp.pin_name,
+                "layer": cp.layer,
+            }))
+            .collect();
+        
+        let output = serde_json::to_string_pretty(&comp_pins)
+            .map_err(|e| CallToolError::from_message(format!("Serialization error: {}", e)))?;
+        
+        Ok(CallToolResult::text_content(vec![
+            TextContent::from(format!(
+                "📋 Sidebar Comp.Pin List for net '{}'\n\
+                 Found {} pins\n{}\n\n\
+                 💡 Use select_netlist_comp_pin to pick one from this list\n\
+                 💡 Use filter_comp_pins to narrow down results",
+                netlist.name, comp_pins.len(), output
+            ))
+        ]))
+    }
+}
+```
+
+--- file: mcp/tools/select_filter_tools.rs ---
+```rust
+// ============================================================================
+// src/mcp/tools/select_filter_tools.rs - FIXED
+// Clear separation: search/filter vs navigation/selection
+// ============================================================================
+
+use rust_mcp_sdk::schema::{schema_utils::CallToolError, CallToolResult, TextContent};
+use rust_mcp_sdk::macros::{mcp_tool, JsonSchema};
+use crate::mcp::handler::PcbViHandler;
+use crate::mcp::state::PcbViCommand;
+
+//*********************//
+//  SelectComponent    //
+//*********************//
+
+#[mcp_tool(
+    name = "select_component",
+    description = "SCENARIO A STEP 2: Selects component from sidebar's filtered component list and centers view. Use AFTER search_components to pick from results. Automatically populates pin list in sidebar."
+)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
+pub struct SelectComponent {
+    /// Component designator (e.g., 'U6', 'PR100', 'PC1043')
+    pub component: String,
+}
+
+impl SelectComponent {
+    pub async fn call_tool(&self, handler: &PcbViHandler) -> Result<CallToolResult, CallToolError> {
+        let state = handler.get_state().await;
+        
+        let component_id = if let Ok(id) = self.component.parse::<usize>() {
+            Some(id)
+        } else {
+            state.components.iter()
+                .find(|c| c.designator.eq_ignore_ascii_case(&self.component))
+                .map(|c| c.id)
+        };
+        
+        if let Some(id) = component_id {
+            handler.send_command(PcbViCommand::SelectComponent(id)).await
+                .map_err(|e| CallToolError::from_message(e))?;
+            
+            Ok(CallToolResult::text_content(vec![
+                TextContent::from(format!(
+                    "✅ Selected component: {}\n\
+                     📍 View centered on component\n\
+                     📌 Pin list now visible in sidebar (SCENARIO A STEP 3: use select_pin next)",
+                    self.component
+                ))
+            ]))
+        } else {
+            Err(CallToolError::from_message(format!("Component '{}' not found. Use search_components first.", self.component)))
+        }
+    }
+}
+
+//*********************//
+//  SelectPin          //
+//*********************//
+
+#[mcp_tool(
+    name = "select_pin",
+    description = "SCENARIO A STEP 3: Selects specific pin from sidebar's pin list (shown after selecting component). Use pin_index from get_component_details. AUTOMATICALLY selects matching netlist in sidebar (STEP 4)."
+)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
+pub struct SelectPin {
+    /// Component designator (must be already selected in sidebar)
+    pub component: String,
+    /// Pin index (0-based) - get from get_component_details output
+    pub pin_index: u32,
+}
+
+impl SelectPin {
+    pub async fn call_tool(&self, handler: &PcbViHandler) -> Result<CallToolResult, CallToolError> {
+        let state = handler.get_state().await;
+        
+        let component_id = if let Ok(id) = self.component.parse::<usize>() {
+            Some(id)
+        } else {
+            state.components.iter()
+                .find(|c| c.designator.eq_ignore_ascii_case(&self.component))
+                .map(|c| c.id)
+        };
+        
+        if let Some(id) = component_id {
+            handler.send_command(PcbViCommand::SelectPin { 
+                component_id: id, 
+                pin_index: self.pin_index as usize
+            }).await.map_err(|e| CallToolError::from_message(e))?;
+            
+            Ok(CallToolResult::text_content(vec![
+                TextContent::from(format!(
+                    "✅ Selected pin {} on component {}\n\
+                     🔗 Netlist automatically selected in sidebar (SCENARIO A STEP 4)\n\
+                     📋 Comp.Pin list now visible (SCENARIO A STEP 5: use select_netlist_comp_pin to jump to other pins on same net)",
+                    self.pin_index, self.component
+                ))
+            ]))
+        } else {
+            Err(CallToolError::from_message(format!("Component '{}' not found", self.component)))
+        }
+    }
+}
+
+//*********************//
+//  SelectNetlist      //
+//*********************//
+
+#[mcp_tool(
+    name = "select_netlist",
+    description = "SCENARIO B STEP 2: Selects netlist from sidebar's filtered netlist list. Use AFTER search_netlists to pick from results. Automatically populates Comp.Pin list showing all component.pin entries on this net."
+)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
+pub struct SelectNetlist {
+    /// Netlist name (e.g., 'VCC', 'I2C_SDA', '+3V_MAIN')
+    pub netlist: String,
+}
+
+impl SelectNetlist {
+    pub async fn call_tool(&self, handler: &PcbViHandler) -> Result<CallToolResult, CallToolError> {
+        let state = handler.get_state().await;
+        
+        let netlist_id = if let Ok(id) = self.netlist.parse::<usize>() {
+            Some(id)
+        } else {
+            state.netlists.iter()
+                .find(|n| n.name.eq_ignore_ascii_case(&self.netlist))
+                .map(|n| n.id)
+        };
+        
+        if let Some(id) = netlist_id {
+            handler.send_command(PcbViCommand::SelectNetlist(id)).await
+                .map_err(|e| CallToolError::from_message(e))?;
+            
+            let net = state.netlists.iter().find(|n| n.id == id);
+            let comp_count = net.map(|n| n.component_count).unwrap_or(0);
+            
+            Ok(CallToolResult::text_content(vec![
+                TextContent::from(format!(
+                    "✅ Selected netlist: {} ({} components)\n\
+                     📋 Comp.Pin list now visible in sidebar\n\
+                     🔍 Use filter_comp_pins to narrow down list\n\
+                     👉 SCENARIO B STEP 3: use select_netlist_comp_pin to pick component.pin from list",
+                    self.netlist, comp_count
+                ))
+            ]))
+        } else {
+            Err(CallToolError::from_message(format!("Netlist '{}' not found. Use search_netlists first.", self.netlist)))
+        }
+    }
+}
+
+//*********************//
+//  SelectNetlistCompPin (RENAMED!) //
+//*********************//
+
+#[mcp_tool(
+    name = "select_netlist_comp_pin",
+    description = "SCENARIO A STEP 5 or SCENARIO B STEP 3: Selects component.pin entry from sidebar's Comp.Pin list (shown after netlist is selected). This list shows all pins connected to current netlist. AUTOMATICALLY selects component (STEP 6) and pin (STEP 7) in sidebar. Use to navigate between different components on same net."
+)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
+pub struct SelectNetlistCompPin {
+    /// Component designator (from Comp.Pin list)
+    pub component: String,
+    /// Pin name (from Comp.Pin list, e.g., 'VCC', 'OUT', '1')
+    pub pin_name: String,
+}
+
+impl SelectNetlistCompPin {
+    pub async fn call_tool(&self, handler: &PcbViHandler) -> Result<CallToolResult, CallToolError> {
+        let state = handler.get_state().await;
+        
+        let component_id = if let Ok(id) = self.component.parse::<usize>() {
+            Some(id)
+        } else {
+            state.components.iter()
+                .find(|c| c.designator.eq_ignore_ascii_case(&self.component))
+                .map(|c| c.id)
+        };
+        
+        if let Some(id) = component_id {
+            handler.send_command(PcbViCommand::SelectCompPin {
+                component_id: id,
+                pin_name: self.pin_name.clone(),
+            }).await.map_err(|e| CallToolError::from_message(e))?;
+            
+            Ok(CallToolResult::text_content(vec![
+                TextContent::from(format!(
+                    "✅ Selected {}.{} from Comp.Pin list\n\
+                     🔄 Component automatically selected in sidebar (SCENARIO A/B STEP 6)\n\
+                     🔄 Pin automatically selected in sidebar (SCENARIO A/B STEP 7)\n\
+                     📍 View centered and auto-switched layer if needed\n\
+                     🔁 Loop back: use select_netlist_comp_pin again to jump to next pin on same net",
+                    self.component, self.pin_name
+                ))
+            ]))
+        } else {
+            Err(CallToolError::from_message(format!(
+                "Component '{}' not found. Make sure netlist is selected first (use select_netlist).",
+                self.component
+            )))
+        }
+    }
+}
+
+//*********************//
+//  FilterCompPins     //
+//*********************//
+
+#[mcp_tool(
+    name = "filter_comp_pins",
+    description = "Filters sidebar's Comp.Pin list for currently selected netlist. Use when netlist has many connections and you want to focus on specific components (e.g., only ICs, only resistors). Requires netlist to be selected first (use select_netlist)."
+)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
+pub struct FilterCompPins {
+    /// Filter pattern - supports wildcards (e.g., 'U*' for ICs, 'PR*' for resistors, '*6' for components ending with 6)
+    pub query: String,
+}
+
+impl FilterCompPins {
+    pub async fn call_tool(&self, handler: &PcbViHandler) -> Result<CallToolResult, CallToolError> {
+        let state = handler.get_state().await;
+        
+        let _selected_netlist_id = state.selected_netlist
+            .ok_or_else(|| CallToolError::from_message(
+                "No netlist selected. WORKFLOW ERROR: Use select_netlist first to populate Comp.Pin list."
+            ))?;
+        
+        handler.send_command(PcbViCommand::FilterCompPins {
+            query: self.query.clone()
+        }).await.map_err(|e| CallToolError::from_message(e))?;
+        
+        Ok(CallToolResult::text_content(vec![
+            TextContent::from(format!(
+                "✅ Filtered Comp.Pin list by '{}'\n\
+                 📋 Only matching component.pin entries now visible in sidebar\n\
+                 💡 Use get_sidebar_comp_pins to see filtered results\n\
+                 🔄 Use select_netlist_comp_pin to pick from filtered list",
+                self.query
+            ))
+        ]))
+    }
+}
+
+//*********************//
+//  ClearFilters       //
+//*********************//
+
+#[mcp_tool(
+    name = "clear_filters",
+    description = "Resets ALL sidebar filters and selections. Use when starting fresh analysis or when sidebar state is confusing. Clears: component filter, netlist filter, comp.pin filter, all selections."
+)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
+pub struct ClearFilters {}
+
+impl ClearFilters {
+    pub async fn call_tool(&self, handler: &PcbViHandler) -> Result<CallToolResult, CallToolError> {
+        handler.send_command(PcbViCommand::ClearFilters).await
+            .map_err(|e| CallToolError::from_message(e))?;
+        
+        Ok(CallToolResult::text_content(vec![
+            TextContent::from(
+                "✅ All sidebar filters and selections cleared\n\
+                 🔄 Sidebar reset to default state\n\
+                 📋 Component list: empty (use search_components)\n\
+                 🔗 Netlist list: empty (use search_netlists)\n\
+                 💡 Start fresh with SCENARIO A or SCENARIO B"
+            )
+        ]))
+    }
+}
+
+
+```
+
+--- file: mcp/tools/topology_tools.rs ---
+```rust
+// ============================================================================
+// src/mcp/tools/topology_tools.rs - NEW FILE
+// High-level topology analysis tools for AI agents
+// ============================================================================
+
+use rust_mcp_sdk::schema::{schema_utils::CallToolError, CallToolResult, TextContent};
+use rust_mcp_sdk::macros::{mcp_tool, JsonSchema};
+use crate::mcp::handler::PcbViHandler;
+use std::collections::{HashMap, HashSet};
+
+//****************************//
+//  AnalyzeComponentRole      //
+//****************************//
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
+pub struct ComponentRoleAnalysis {
+    pub designator: String,
+    pub inferred_type: String, // "resistor", "capacitor", "ic", etc.
+    pub signal_routing_potential: String, // "high", "medium", "low", "none"
+    pub analysis: String,
+    pub connected_nets: Vec<String>,
+    pub recommendation: String,
+}
+
+#[mcp_tool(
+    name = "analyze_component_role",
+    description = "Analyzes component's role in signal routing. Returns whether it's worth tracing through this component for signal analysis. CRITICAL for avoiding dead ends (GND caps, NC pins, test points)."
+)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
+pub struct AnalyzeComponentRole {
+    /// Component designator to analyze
+    pub designator: String,
+}
+
+impl AnalyzeComponentRole {
+    pub async fn call_tool(&self, handler: &PcbViHandler) -> Result<CallToolResult, CallToolError> {
+        let app_state = handler.get_app_state().await
+            .map_err(|e| CallToolError::from_message(format!("Failed to get app state: {}", e)))?;
+
+        let component = app_state.components.iter()
+            .find(|c| c.designator.eq_ignore_ascii_case(&self.designator))
+            .ok_or_else(|| CallToolError::from_message(format!("Component '{}' not found.", self.designator)))?;
+
+        let pin_count = component.pins.len();
+        let inferred_type = Self::infer_type(&component.designator, pin_count);
+        
+        // Gather connected nets
+        let mut connected_nets = Vec::new();
+        let mut has_gnd = false;
+        let mut has_power = false;
+        let mut has_nc = false;
+        
+        for pin in &component.pins {
+            let net_name = if let Some(net_id) = pin.net_id {
+                app_state.netlists.iter()
+                    .find(|n| n.id == net_id)
+                    .map(|n| n.name.clone())
+            } else {
+                Some(pin.name.clone())
+            };
+            
+            if let Some(name) = net_name {
+                let upper = name.to_uppercase();
+                if upper.contains("GND") || upper.contains("VSS") {
+                    has_gnd = true;
+                } else if upper.contains("VCC") || upper.contains("VDD") || upper.starts_with("+") {
+                    has_power = true;
+                } else if upper.contains("NC") {
+                    has_nc = true;
+                }
+                connected_nets.push(name);
+            }
+        }
+        
+        // Analyze signal routing potential
+        let (potential, analysis, recommendation) = Self::analyze_routing_potential(
+            &inferred_type, pin_count, has_gnd, has_power, has_nc, &connected_nets
+        );
+        
+        let result = ComponentRoleAnalysis {
+            designator: component.designator.clone(),
+            inferred_type,
+            signal_routing_potential: potential,
+            analysis,
+            connected_nets,
+            recommendation,
+        };
+        
+        let output = serde_json::to_string_pretty(&result)
+            .map_err(|e| CallToolError::from_message(format!("Serialization error: {}", e)))?;
+        
+        Ok(CallToolResult::text_content(vec![
+            TextContent::from(format!("🔬 Component Role Analysis for {}\n{}", self.designator, output))
+        ]))
+    }
+    
+    fn infer_type(designator: &str, pin_count: usize) -> String {
+        let upper = designator.to_uppercase();
+        let stripped = upper.trim_start_matches('P').trim_start_matches('R');
+        
+        if stripped.starts_with('R') && pin_count == 2 {
+            "resistor".to_string()
+        } else if stripped.starts_with('C') && pin_count == 2 {
+            "capacitor".to_string()
+        } else if stripped.starts_with('L') && pin_count == 2 {
+            "inductor".to_string()
+        } else if stripped.starts_with('D') {
+            "diode".to_string()
+        } else if stripped.starts_with('Q') || stripped.starts_with('T') {
+            "transistor".to_string()
+        } else if stripped.starts_with("TP") || stripped.starts_with("TEST") {
+            "test_point".to_string()
+        } else if stripped.starts_with('U') || pin_count > 4 {
+            "ic".to_string()
+        } else {
+            "unknown".to_string()
+        }
+    }
+    
+    fn analyze_routing_potential(
+        comp_type: &str,
+        pin_count: usize,
+        has_gnd: bool,
+        has_power: bool,
+        has_nc: bool,
+        nets: &[String]
+    ) -> (String, String, String) {
+        // Rule 1: Test points - dead end
+        if comp_type == "test_point" {
+            return (
+                "none".to_string(),
+                "Test point - monitoring node only".to_string(),
+                "❌ SKIP: Test points don't route signals".to_string()
+            );
+        }
+        
+        // Rule 2: Capacitors with GND - decoupling, not signal routing
+        if comp_type == "capacitor" && has_gnd {
+            return (
+                "low".to_string(),
+                "Decoupling capacitor to GND - filters noise, doesn't route signal".to_string(),
+                "⚠️ SKIP: Decoupling caps are dead ends for signal tracing".to_string()
+            );
+        }
+        
+        // Rule 3: NC pins - not connected
+        if has_nc {
+            return (
+                "none".to_string(),
+                "Has NC (Not Connected) pins".to_string(),
+                "❌ SKIP: NC pins don't route signals".to_string()
+            );
+        }
+        
+        // Rule 4: 2-pin passive components (R, L, C without GND)
+        if pin_count == 2 && matches!(comp_type, "resistor" | "inductor" | "capacitor") {
+            if has_gnd || has_power {
+                return (
+                    "low".to_string(),
+                    format!("{} connected to power/ground rail", comp_type),
+                    "⚠️ LIKELY SKIP: Pull-up/down or filtering, not signal routing".to_string()
+                );
+            } else {
+                return (
+                    "high".to_string(),
+                    format!("{} in signal path - likely passes signal through", comp_type),
+                    "✅ TRACE: 2-pin passive in signal path - follow both nets".to_string()
+                );
+            }
+        }
+        
+        // Rule 5: ICs with many pins - complex, requires context
+        if comp_type == "ic" && pin_count > 20 {
+            return (
+                "medium".to_string(),
+                format!("Complex IC with {} pins - signal may branch significantly", pin_count),
+                "⚠️ CAREFUL: High pin count IC - consider if all branches are relevant".to_string()
+            );
+        }
+        
+        // Rule 6: Transistors/Diodes - active components
+        if matches!(comp_type, "transistor" | "diode") {
+            return (
+                "medium".to_string(),
+                format!("{} - active component, may switch/rectify signal", comp_type),
+                "💡 CONSIDER: Active component - signal may be modified".to_string()
+            );
+        }
+        
+        // Default: unknown component
+        (
+            "medium".to_string(),
+            format!("Component type: {} with {} pins", comp_type, pin_count),
+            "💡 ANALYZE CAREFULLY: Unknown component role".to_string()
+        )
+    }
+}
+
+//****************************//
+//  AnalyzeNetRole            //
+//****************************//
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
+pub struct NetRoleAnalysis {
+    pub net_name: String,
+    pub inferred_role: String, // "power", "ground", "signal", "nc"
+    pub signal_routing_potential: String, // "high", "low", "none"
+    pub component_count: u32,
+    pub analysis: String,
+    pub recommendation: String,
+}
+
+#[mcp_tool(
+    name = "analyze_net_role",
+    description = "Analyzes netlist's role in circuit. Identifies power/ground/NC nets that should be avoided in signal tracing. CRITICAL for efficient topology analysis."
+)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
+pub struct AnalyzeNetRole {
+    /// Netlist name to analyze
+    pub net_name: String,
+}
+
+impl AnalyzeNetRole {
+    pub async fn call_tool(&self, handler: &PcbViHandler) -> Result<CallToolResult, CallToolError> {
+        let state = handler.get_state().await;
+        
+        let netlist = state.netlists.iter()
+            .find(|n| n.name.eq_ignore_ascii_case(&self.net_name))
+            .ok_or_else(|| CallToolError::from_message(format!("Netlist '{}' not found.", self.net_name)))?;
+        
+        let inferred_role = Self::infer_role(&netlist.name);
+        let (potential, analysis, recommendation) = Self::analyze_signal_potential(
+            &inferred_role,
+            netlist.component_count
+        );
+        
+        let result = NetRoleAnalysis {
+            net_name: netlist.name.clone(),
+            inferred_role,
+            signal_routing_potential: potential,
+            component_count: netlist.component_count as u32,
+            analysis,
+            recommendation,
+        };
+        
+        let output = serde_json::to_string_pretty(&result)
+            .map_err(|e| CallToolError::from_message(format!("Serialization error: {}", e)))?;
+        
+        Ok(CallToolResult::text_content(vec![
+            TextContent::from(format!("🔬 Net Role Analysis for {}\n{}", self.net_name, output))
+        ]))
+    }
+    
+    fn infer_role(name: &str) -> String {
+        let upper = name.to_uppercase();
+        
+        if upper.contains("GND") || upper.contains("VSS") || upper.contains("GROUND") {
+            "ground".to_string()
+        } else if upper.contains("VCC") || upper.contains("VDD") || upper.contains("VBAT") 
+                  || upper.starts_with("+") || upper.starts_with("-") 
+                  || upper.contains("POWER") {
+            "power".to_string()
+        } else if upper.contains("NC") || upper.starts_with("(NC)") || upper == "NC" {
+            "nc".to_string()
+        } else {
+            "signal".to_string()
+        }
+    }
+    
+    fn analyze_signal_potential(
+        role: &str,
+        comp_count: usize
+    ) -> (String, String, String) {
+        match role {
+            "ground" => (
+                "none".to_string(),
+                format!("Ground net with {} connections - reference plane, not signal", comp_count),
+                "❌ SKIP: Ground nets don't carry signals".to_string()
+            ),
+            "power" => (
+                "none".to_string(),
+                format!("Power net with {} connections - supply rail, not signal", comp_count),
+                "❌ SKIP: Power nets don't carry data signals".to_string()
+            ),
+            "nc" => (
+                "none".to_string(),
+                "Not Connected - no signal".to_string(),
+                "❌ SKIP: NC nets have no signal".to_string()
+            ),
+            "signal" => {
+                if comp_count > 10 {
+                    (
+                        "low".to_string(),
+                        format!("Signal net with {} connections - may be bus or highly branched", comp_count),
+                        "⚠️ CONSIDER: High fanout - trace may become complex".to_string()
+                    )
+                } else {
+                    (
+                        "high".to_string(),
+                        format!("Signal net with {} connections - good for tracing", comp_count),
+                        "✅ TRACE: Point-to-point or low fanout signal".to_string()
+                    )
+                }
+            },
+            _ => (
+                "medium".to_string(),
+                "Unknown net role".to_string(),
+                "💡 ANALYZE: Unknown net type".to_string()
+            )
+        }
+    }
+}
+
+//****************************//
+//  FindSignalPath            //
+//****************************//
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
+pub struct SignalPathNode {
+    pub component_designator: String,
+    pub pin_name: String,
+    pub net_name: String,
+    pub depth: u32,
+    pub routing_potential: String, // "high", "medium", "low", "none"
+}
+
+#[mcp_tool(
+    name = "find_signal_path",
+    description = "Traces signal path from component.pin, filtering out dead ends (GND, NC, test points). Returns ONLY components with signal routing potential. Use this for efficient signal tracing."
+)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
+pub struct FindSignalPath {
+    /// Starting component designator
+    pub component: String,
+    /// Starting pin name (e.g., 'OUT', 'VCC', 'PA0')
+    pub pin: String,
+    /// Maximum depth to trace (default: 3, max: 5)
+    pub max_depth: Option<u32>,
+}
+
+impl FindSignalPath {
+    pub async fn call_tool(&self, handler: &PcbViHandler) -> Result<CallToolResult, CallToolError> {
+        let app_state = handler.get_app_state().await
+            .map_err(|e| CallToolError::from_message(format!("Failed to get app state: {}", e)))?;
+
+        let start_comp = app_state.components.iter()
+            .find(|c| c.designator.eq_ignore_ascii_case(&self.component))
+            .ok_or_else(|| CallToolError::from_message(format!("Component '{}' not found.", self.component)))?;
+
+        let start_pin = start_comp.pins.iter()
+            .find(|p| p.name.eq_ignore_ascii_case(&self.pin))
+            .ok_or_else(|| CallToolError::from_message(format!("Pin '{}' not found on {}.", self.pin, self.component)))?;
+
+        let max_depth = self.max_depth.unwrap_or(3).min(5);
+        
+        // Get starting net
+        let start_net_name = if let Some(net_id) = start_pin.net_id {
+            app_state.netlists.iter()
+                .find(|n| n.id == net_id)
+                .map(|n| n.name.clone())
+                .unwrap_or(start_pin.name.clone())
+        } else {
+            start_pin.name.clone()
+        };
+        
+        // BFS traversal with filtering
+        let mut path: Vec<SignalPathNode> = Vec::new();
+        let mut visited_nets: HashSet<String> = HashSet::new();
+        let mut queue: Vec<(String, u32)> = vec![(start_net_name.clone(), 0)];
+        
+        visited_nets.insert(start_net_name.clone());
+        
+        // Add starting node
+        path.push(SignalPathNode {
+            component_designator: start_comp.designator.clone(),
+            pin_name: start_pin.name.clone(),
+            net_name: start_net_name,
+            depth: 0,
+            routing_potential: "high".to_string(),
+        });
+        
+        while let Some((current_net, depth)) = queue.pop() {
+            if depth >= max_depth {
+                continue;
+            }
+            
+            // Skip power/ground/NC nets
+            if Self::is_skip_net(&current_net) {
+                continue;
+            }
+            
+            // Find netlist
+            let netlist = match app_state.netlists.iter().find(|n| n.name == current_net) {
+                Some(n) => n,
+                None => continue,
+            };
+            
+            // Find all components on this net
+            for comp_id in &netlist.component_ids {
+                let component = match app_state.components.iter().find(|c| c.id == *comp_id) {
+                    Some(c) => c,
+                    None => continue,
+                };
+                
+                // Skip if already visited as starting component
+                if component.designator == start_comp.designator {
+                    continue;
+                }
+                
+                // Analyze component role
+                let comp_type = Self::infer_type(&component.designator, component.pins.len());
+                let routing_potential = Self::get_routing_potential(&comp_type, component);
+                
+                // Skip dead ends
+                if routing_potential == "none" {
+                    continue;
+                }
+                
+                // Find connected pins on this component
+                for pin in &component.pins {
+                    let pin_net = if let Some(nid) = pin.net_id {
+                        app_state.netlists.iter()
+                            .find(|n| n.id == nid)
+                            .map(|n| n.name.clone())
+                            .unwrap_or(pin.name.clone())
+                    } else {
+                        pin.name.clone()
+                    };
+                    
+                    // Skip same net (input pin)
+                    if pin_net == current_net {
+                        continue;
+                    }
+                    
+                    // Skip if already visited
+                    if visited_nets.contains(&pin_net) {
+                        continue;
+                    }
+                    
+                    // Add to path
+                    path.push(SignalPathNode {
+                        component_designator: component.designator.clone(),
+                        pin_name: pin.name.clone(),
+                        net_name: pin_net.clone(),
+                        depth: depth + 1,
+                        routing_potential: routing_potential.clone(),
+                    });
+                    
+                    // Add to queue for further exploration
+                    queue.push((pin_net.clone(), depth + 1));
+                    visited_nets.insert(pin_net);
+                }
+            }
+        }
+        
+        let output = serde_json::to_string_pretty(&path)
+            .map_err(|e| CallToolError::from_message(format!("Serialization error: {}", e)))?;
+        
+        Ok(CallToolResult::text_content(vec![
+            TextContent::from(format!(
+                "🛤️ Signal Path from {}.{} (depth: {})\n{}\n\n💡 Filtered out: GND, power, NC, test points, decoupling caps",
+                self.component, self.pin, max_depth, output
+            ))
+        ]))
+    }
+    
+    fn is_skip_net(name: &str) -> bool {
+        let upper = name.to_uppercase();
+        upper.contains("GND") || upper.contains("VCC") || upper.contains("VDD") 
+            || upper.contains("VSS") || upper.contains("NC") || upper.starts_with("+")
+            || upper.starts_with("-")
+    }
+    
+    fn infer_type(designator: &str, pin_count: usize) -> String {
+        let upper = designator.to_uppercase();
+        let px: &[_] = &['A', 'B', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'M', 'N', 'O', 'P', 'S', 'T', 'V', 'W', 'X', 'Y', 'Z'];
+        let stripped = upper.trim_start_matches(px);
+        
+        if stripped.starts_with('R') && pin_count == 2 {
+            "resistor".to_string()
+        } else if stripped.starts_with('C') && pin_count == 2 {
+            "capacitor".to_string()
+        } else if stripped.starts_with('L') && pin_count == 2 {
+            "inductor".to_string()
+        } else if stripped.starts_with("T") {
+            "test_point".to_string()
+        } else if stripped.starts_with('Q') || pin_count >= 3{
+            "ic".to_string()
+        } else if stripped.starts_with('U') || pin_count > 4 {
+            "ic".to_string()
+        } else {
+            "unknown".to_string()
+        }
+    }
+    
+    fn get_routing_potential(comp_type: &str, component: &crate::pcb::Component) -> String {
+        // Test points - dead end
+        if comp_type == "test_point" {
+            return "none".to_string();
+        }
+        
+        // Check for GND connections
+        let has_gnd = component.pins.iter().any(|p| {
+            p.name.to_uppercase().contains("GND") || p.name.to_uppercase().contains("VSS")
+        });
+        
+        // Capacitors with GND - decoupling
+        if comp_type == "capacitor" && has_gnd {
+            return "low".to_string();
+        }
+        
+        // 2-pin passives without GND - signal routing
+        if component.pins.len() == 2 && matches!(comp_type, "resistor" | "inductor" | "capacitor") {
+            if has_gnd {
+                "low".to_string()
+            } else {
+                "high".to_string()
+            }
+        } else if comp_type == "ic" {
+            "medium".to_string()
+        } else {
+            "medium".to_string()
+        }
+    }
+}
+
+//****************************//
+//  ListRoutableComponents    //
+//****************************//
+
+#[mcp_tool(
+    name = "list_routable_components",
+    description = "Lists components with HIGH signal routing potential on a given net. Filters out decoupling caps, test points, GND connections. Use this to decide which components to trace through."
+)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
+pub struct ListRoutableComponents {
+    /// Net name to analyze
+    pub net_name: String,
+}
+
+impl ListRoutableComponents {
+    pub async fn call_tool(&self, handler: &PcbViHandler) -> Result<CallToolResult, CallToolError> {
+        let app_state = handler.get_app_state().await
+            .map_err(|e| CallToolError::from_message(format!("Failed to get app state: {}", e)))?;
+
+        let netlist = app_state.netlists.iter()
+            .find(|n| n.name.eq_ignore_ascii_case(&self.net_name))
+            .ok_or_else(|| CallToolError::from_message(format!("Netlist '{}' not found.", self.net_name)))?;
+
+        let mut routable = Vec::new();
+        
+        for comp_id in &netlist.component_ids {
+            let component = match app_state.components.iter().find(|c| c.id == *comp_id) {
+                Some(c) => c,
+                None => continue,
+            };
+            
+            let comp_type = Self::infer_type(&component.designator, component.pins.len());
+            let potential = Self::get_routing_potential(&comp_type, component);
+            
+            if potential == "high" || potential == "medium" {
+                routable.push(serde_json::json!({
+                    "designator": component.designator,
+                    "type": comp_type,
+                    "routing_potential": potential,
+                    "pin_count": component.pins.len(),
+                }));
+            }
+        }
+        
+        let output = serde_json::to_string_pretty(&routable)
+            .map_err(|e| CallToolError::from_message(format!("Serialization error: {}", e)))?;
+        
+        Ok(CallToolResult::text_content(vec![
+            TextContent::from(format!(
+                "🔌 Routable components on net '{}' (found {})\n{}\n\n💡 Filtered out: test points, decoupling caps, GND connections",
+                self.net_name, routable.len(), output
+            ))
+        ]))
+    }
+    
+    fn infer_type(designator: &str, pin_count: usize) -> String {
+        let upper = designator.to_uppercase();
+        let stripped = upper.trim_start_matches('P').trim_start_matches('R');
+        
+        if stripped.starts_with('R') && pin_count == 2 { "resistor".to_string() }
+        else if stripped.starts_with('C') && pin_count == 2 { "capacitor".to_string() }
+        else if stripped.starts_with('L') && pin_count == 2 { "inductor".to_string() }
+        else if stripped.starts_with("TP") { "test_point".to_string() }
+        else if stripped.starts_with('U') || pin_count > 4 { "ic".to_string() }
+        else { "unknown".to_string() }
+    }
+    
+    fn get_routing_potential(comp_type: &str, component: &crate::pcb::Component) -> String {
+        if comp_type == "test_point" { return "none".to_string(); }
+        
+        let has_gnd = component.pins.iter().any(|p| {
+            p.name.to_uppercase().contains("GND") || p.name.to_uppercase().contains("VSS")
+        });
+        
+        if comp_type == "capacitor" && has_gnd { return "low".to_string(); }
+        
+        if component.pins.len() == 2 && matches!(comp_type, "resistor" | "inductor" | "capacitor") {
+            if has_gnd { "low".to_string() } else { "high".to_string() }
+        } else if comp_type == "ic" {
+            "medium".to_string()
+        } else {
+            "medium".to_string()
+        }
+    }
+}
+```
+
+--- file: mcp/tools/trace_from_pin.rs ---
+```rust
+use std::collections::{HashSet, VecDeque};
+use rust_mcp_sdk::schema::{schema_utils::CallToolError, CallToolResult, TextContent};
+use rust_mcp_sdk::macros::{mcp_tool, JsonSchema};
+use crate::mcp::handler::PcbViHandler;
+
+
+//***************************//
+//  TraceNetFromPin          //
+//***************************//
+
+#[mcp_tool(
+    name = "trace_net_from_pin",
+    description = "Traces a net from a specific component pin. Returns the net name and all other components/pins connected to it. Perfect for topology analysis."
+)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
+pub struct TraceNetFromPin {
+    /// Component designator (e.g., 'U6')
+    pub component: String,
+    /// Pin name or number (e.g., '+3V_TBTA_PDLDO', '8')
+    pub pin: String,
+}
+
+impl TraceNetFromPin {
+    pub async fn call_tool(&self, handler: &PcbViHandler) -> Result<CallToolResult, CallToolError> {
+        let app_state = handler.get_app_state().await
+            .map_err(|e| CallToolError::from_message(format!("Failed to get app state: {}", e)))?;
+
+        let component = app_state.components.iter()
+            .find(|c| c.designator.eq_ignore_ascii_case(&self.component))
+            .ok_or_else(|| CallToolError::from_message(format!("Component '{}' not found", self.component)))?;
+
+        let pin = component.pins.iter()
+            .find(|p| p.name.eq_ignore_ascii_case(&self.pin) || p.number == self.pin)
+            .ok_or_else(|| CallToolError::from_message(format!("Pin '{}' not found on {}", self.pin, self.component)))?;
+
+        // FIXED: Use pin name as net name if net_id is null (common in boardview files)
+        let (net_id, net_name) = if let Some(id) = pin.net_id {
+        let netlist = app_state.netlists.iter()
+                .find(|n| n.id == id)
+            .ok_or_else(|| CallToolError::from_message("Net not found in netlist"))?;
+            (id, netlist.name.clone())
+        } else {
+            // Fallback: use pin name as net name (boardview convention)
+            let netlist = app_state.netlists.iter()
+                .find(|n| n.name.eq_ignore_ascii_case(&pin.name))
+                .ok_or_else(|| CallToolError::from_message(
+                    format!("Pin {}.{} is not connected to any net (net_id is null and no matching netlist found)", 
+                        self.component, self.pin)
+                ))?;
+            (netlist.id, netlist.name.clone())
+        };
+
+        // Find all other pins on this net
+        let mut connections = Vec::new();
+        for comp in &app_state.components {
+            for p in &comp.pins {
+                // Match by net_id OR pin name
+                let is_on_same_net = p.net_id == Some(net_id) 
+                    || p.name.eq_ignore_ascii_case(&net_name);
+                
+                if is_on_same_net {
+                    // Skip the source pin
+                    if comp.id == component.id && p.number == pin.number {
+                        continue;
+                    }
+                    connections.push(serde_json::json!({
+                        "component_id": comp.id,
+                        "component_designator": comp.designator,
+                        "component_value": comp.value,
+                        "component_layer": comp.layer,
+                        "pin_number": p.number,
+                        "pin_name": p.name,
+                    }));
+                }
+            }
+        }
+
+        let result = serde_json::json!({
+            "source_component": self.component,
+            "source_pin": self.pin,
+            "source_layer": component.layer,
+            "net_id": net_id,
+            "net_name": net_name,
+            "connections": connections,
+            "connection_count": connections.len(),
+            "cross_layer_detected": connections.iter().any(|c| c.get("component_layer").and_then(|v| v.as_str()) 
+            != Some(&component.layer)),
+        });
+
+        let output = serde_json::to_string_pretty(&result)
+            .map_err(|e| CallToolError::from_message(format!("Serialization error: {}", e)))?;
+
+        Ok(CallToolResult::text_content(vec![
+            TextContent::from(format!(
+                "🔍 Trace from {}.{} → Net '{}' ({} connections)\n{}",
+                self.component, self.pin, net_name, connections.len(), output
+            ))
+        ]))
+    }
+}
+```
+
+--- file: mcp/tools.rs ---
+```rust
+// ============================================================================
+// src/mcp/tools.rs - Optimized MCP Tools for PCBVi Control
+// ============================================================================
+pub mod basic_tools;
+pub mod get_search_tools;
+pub mod select_filter_tools;
+pub mod topology_tools;
+pub mod trace_from_pin;
+pub mod batch_select_sequence;
+pub mod get_edges;
+
+use rust_mcp_sdk::tool_box;
+
+pub use basic_tools::*;
+pub use get_search_tools::*;
+pub use select_filter_tools::*;
+pub use topology_tools::*;
+pub use trace_from_pin::TraceNetFromPin;
+pub use batch_select_sequence::BatchSelectSequence;
+pub use get_edges::GetEdges;
+
+// *****************//
+//  PcbViTools     //
+// *****************//
+tool_box!(
+    PcbViTools,
+    [
+        // ============================================================================
+        // LAYER 1: DISCOVERY & CONTEXT (populate sidebar lists)
+        // ============================================================================
+        GetViewState,           // Check current UI state
+        SearchComponents,       // SCENARIO A STEP 1: Search & populate component list
+        SearchNetlists,         // SCENARIO B STEP 1: Search & populate netlist list
+        GetComponentDetails,    // Get pin indices (needed for select_pin)
+        GetNetlistDetails,      // Full connection list (WARNING: can be huge)
+        GetSidebarCompPins,     // See Comp.Pin list contents
+        
+        // ============================================================================
+        // LAYER 2: TOPOLOGY ANALYSIS (smart filtering & signal tracing)
+        // ============================================================================
+        AnalyzeComponentRole,   // Is this component worth tracing through?
+        AnalyzeNetRole,         // Is this net signal/power/ground?
+        FindSignalPath,         // Trace signal path with smart filtering
+        ListRoutableComponents, // Which components on this net are routable?
+        
+        // ============================================================================
+        // LAYER 3: SELECTION & NAVIGATION (sidebar interaction)
+        // ============================================================================
+        // SCENARIO A: Component → Pin → Netlist → Other Pins
+        SelectComponent,        // STEP 2: Select from component list
+        SelectPin,              // STEP 3: Select from pin list (auto-selects netlist)
+        
+        // SCENARIO B: Netlist → Comp.Pin → Component
+        SelectNetlist,          // STEP 2: Select from netlist list (shows Comp.Pin)
+        SelectNetlistCompPin,   // STEP 3 (A/B): Select from Comp.Pin list (RENAMED!)
+        
+        // Filtering
+        ClearFilters,           // Reset all filters & selections
+        FilterCompPins,         // Filter Comp.Pin list by pattern
+        
+        // View control
+        SetZoom,
+        SetPan,
+        SetRotation,
+        SetLayer,
+        LoadFile,
+        
+        // Advanced
+        TraceNetFromPin,        // Original trace tool
+        BatchSelectSequence,    // Visual path animation
+        GetEdges,               // Deep circuit context
+    ]
+);
+```
+
