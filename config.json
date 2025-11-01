@@ -2,7 +2,7 @@
   "mcp_servers": [
     {
       "name": "pcbvi-mcp-server",
-      "url": "http://localhost:8080/sse"
+      "url": "http://localhost:8080/sse "
     },
     {
       "name": "another-server",

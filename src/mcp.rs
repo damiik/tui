@@ -199,7 +199,6 @@ impl McpClient {
                         }
 
                         let full_url = join_url(&url, &endpoint);
-                        let post_url = full_url.clone();
                     let _ = event_tx.send(McpClientEvent::Debug(
                         format!("🔗 Session endpoint: {}", full_url)
                     )).await;
@@ -209,18 +208,19 @@ impl McpClient {
                         let sse_event_tx = event_tx.clone();
                         let sse_session = session_endpoint.clone();
                         let sse_pending = pending.clone();
+                        let full_url_clone = full_url.clone();
                         let (sse_shutdown_tx, sse_shutdown_rx) = oneshot::channel();
 
                         *sse_shutdown.lock().await = Some(sse_shutdown_tx);
 
                         tokio::spawn(async move {
                         let _ = sse_event_tx.send(McpClientEvent::Debug(
-                            format!("🎧 Starting SSE listener on {}", full_url)
+                            format!("🎧 Starting SSE listener on {}", full_url_clone)
                             )).await;
 
                             sse_stream_loop(
                                 sse_client,
-                                full_url,
+                                full_url_clone,
                                 sse_event_tx.clone(),
                                 sse_session,
                                 sse_pending,
@@ -251,7 +251,7 @@ impl McpClient {
                         format!("📤 Sending initialize: {}", serde_json::to_string(&init).unwrap_or_default())
                     )).await;
 
-                    match client.post(&post_url)
+                    match client.post(&full_url)
                             .header("Content-Type", "application/json")
                             .body(init.to_string())
                             .send()
@@ -483,7 +483,6 @@ async fn sse_stream_loop(
 // JSON-RPC EVENT HANDLER
 // ═══════════════════════════════════════════════════════════════
 
-/// Handle JSON-RPC object received via SSE
 async fn handle_json_rpc_event(
     v: serde_json::Value,
     event_tx: &mpsc::Sender<McpClientEvent>,
@@ -555,12 +554,48 @@ async fn handle_json_rpc_event(
 // UTILITIES
 // ═══════════════════════════════════════════════════════════════
 
-/// Join base URL and endpoint path
+/// Join base URL and endpoint path intelligently
+/// If endpoint starts with '/', replace the path in base URL
+/// Otherwise append to base URL
 fn join_url(base: &str, endpoint: &str) -> String {
+    // If endpoint is absolute URL, use it directly
     if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
         return endpoint.into();
     }
 
+    // Parse base URL to extract scheme, host, and port
+    if let Some(scheme_end) = base.find("://") {
+        let scheme = &base[..scheme_end + 3]; // includes ://
+        let rest = &base[scheme_end + 3..];
+        
+        // Find where path starts (after host:port)
+        let path_start = rest.find('/').unwrap_or(rest.len());
+        let host_port = &rest[..path_start];
+        
+        // If endpoint starts with '/', it replaces the entire path
+        if endpoint.starts_with('/') {
+            return format!("{}{}{}", scheme, host_port, endpoint);
+        }
+        
+        // Otherwise, append to existing path
+        let existing_path = if path_start < rest.len() {
+            &rest[path_start..]
+        } else {
+            ""
+        };
+        
+        let mut result = format!("{}{}{}", scheme, host_port, existing_path);
+        if !result.ends_with('/') && !endpoint.starts_with('/') {
+            result.push('/');
+        }
+        if result.ends_with('/') && endpoint.starts_with('/') {
+            result.pop();
+        }
+        result.push_str(endpoint);
+        return result;
+    }
+    
+    // Fallback: simple concatenation
     let mut b = base.to_string();
     if b.ends_with('/') && endpoint.starts_with('/') {
         b.pop();
@@ -569,4 +604,49 @@ fn join_url(base: &str, endpoint: &str) -> String {
         b.push('/');
     }
     b + endpoint
+}
+
+#[cfg(test)]
+mod url_tests {
+    use super::*;
+
+    #[test]
+    fn test_join_url_absolute_endpoint() {
+        assert_eq!(
+            join_url("http://localhost:8080/sse", "/messages?session=123"),
+            "http://localhost:8080/messages?session=123"
+        );
+    }
+
+    #[test]
+    fn test_join_url_relative_endpoint() {
+        assert_eq!(
+            join_url("http://localhost:8080/sse", "messages"),
+            "http://localhost:8080/sse/messages"
+        );
+    }
+
+    #[test]
+    fn test_join_url_no_path() {
+        assert_eq!(
+            join_url("http://localhost:8080", "/messages"),
+            "http://localhost:8080/messages"
+        );
+    }
+
+    #[test]
+    fn test_join_url_with_query() {
+        assert_eq!(
+            join_url("http://localhost:8080/api", "/session?id=abc"),
+            "http://localhost:8080/session?id=abc"
+        );
+    }
+
+    #[test]
+    fn test_join_url_full_url_endpoint() {
+        assert_eq!(
+            join_url("http://localhost:8080/sse", "http://example.com/path"),
+            "http://example.com/path"
+        );
+    }
 }
