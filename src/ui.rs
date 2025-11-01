@@ -105,11 +105,18 @@ impl UI {
     fn render_status_bar(&self, frame: &mut Frame, app: &App, area: Rect) {
         let mode = app.mode();
 
+        // If in server selection mode, show different indicator
+        let (mode_text, mode_color) = if app.server_selection().is_some() {
+            ("SELECT", Color::Magenta)
+        } else {
+            (mode.name(), mode.color())
+        };
+
         let mode_indicator = Span::styled(
-            format!(" {} ", mode.name()),
+            format!(" {} ", mode_text),
             Style::default()
                 .fg(Color::Black)
-                .bg(mode.color())
+                .bg(mode_color)
                 .add_modifier(Modifier::BOLD),
         );
 
@@ -118,10 +125,17 @@ impl UI {
             Style::default().fg(Color::White),
         );
 
-        let help_text = Span::styled(
+        let help_text = if app.server_selection().is_some() {
+            Span::styled(
+                " ↑↓:Navigate | Enter:Select | Esc:Cancel ",
+                Style::default().fg(Color::DarkGray),
+            )
+        } else {
+            Span::styled(
             format!(" {} ", mode.help_text()),
             Style::default().fg(Color::DarkGray),
-        );
+            )
+        };
 
         let line = Line::from(vec![mode_indicator, status_text, help_text]);
 
@@ -136,6 +150,14 @@ impl UI {
     // ═══════════════════════════════════════════════════════════════
 
     fn render_input_line(&self, frame: &mut Frame, app: &App, area: Rect) {
+        // If in server selection mode, show nothing or selection info
+        if app.server_selection().is_some() {
+            let paragraph = Paragraph::new("")
+                .style(Style::default().bg(Color::Black));
+            frame.render_widget(paragraph, area);
+            return;
+        }
+
         let (prefix, content, cursor_offset) = match app.mode() {
             Mode::Normal => ("", "", 0),
             Mode::Insert => ("> ", app.input_buffer(), 2),

@@ -38,14 +38,28 @@ async fn main() -> Result<()> {
 
     res
 }
+
 async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     mut app: App,
     event_loop: &mut EventLoop,
     ui: &UI,
 ) -> Result<()> {
+    let mut last_mouse_state = app.mouse_enabled();
+
     loop {
         terminal.draw(|frame| ui.render(frame, &app))?;
+
+        // Handle mouse capture state changes
+        let current_mouse_state = app.mouse_enabled();
+        if current_mouse_state != last_mouse_state {
+            if current_mouse_state {
+                execute!(terminal.backend_mut(), EnableMouseCapture)?;
+            } else {
+                execute!(terminal.backend_mut(), DisableMouseCapture)?;
+            }
+            last_mouse_state = current_mouse_state;
+        }
 
         if let Some(event) = event_loop.next()? {
             app = app.handle_event(event).await?;

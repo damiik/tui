@@ -1,30 +1,41 @@
 # MCP Test Client
 
-Elegancki klient MCP z interfejsem terminalowym inspirowanym filozofią Vim.
+Elegancki klient MCP (Model Context Protocol) z interfejsem terminalowym inspirowanym filozofią Vim.
 
-## Filozofia projektu
+## Nowe funkcje
 
-### Funkcyjne wzorce programowania
-- **Immutability** - wszystkie transformacje stanu zwracają nowe wartości
-- **Pure functions** - rendering UI i parsowanie komend bez efektów ubocznych
-- **Algebraiczne typy danych** - `Mode`, `Command`, `Event` jako enums
-- **Kompozycja** - moduły łączą się przez czyste interfejsy
+### 🔍 Rozszerzone debugowanie
+- Szczegółowe logi procesu połączenia
+- Śledzenie SSE event stream
+- Debug JSON-RPC request/response
+- Informacje o inicjalizacji sesji
 
-### Architektura modułowa
+### 🎯 Interaktywny wybór serwera
+- `:mcp connect` otwiera menu wyboru
+- Nawigacja: `↑`/`↓` lub `j`/`k`
+- Wybór numerem: `1`, `2`, `3`...
+- `Enter` - połącz, `Esc` - anuluj
 
+## Konfiguracja
+
+Utwórz plik `config.json` w głównym katalogu projektu:
+
+```json
+{
+  "mcp_servers": [
+    {
+      "name": "local-server",
+      "url": "http://localhost:8080"
+    },
+    {
+      "name": "remote-server",
+      "url": "https://example.com/mcp"
+    }
+  ]
+}
 ```
-src/
-├── main.rs         # Entry point, terminal setup/teardown
-├── lib.rs          # Module exports
-├── app.rs          # Core state machine: App × Event → App
-├── mode.rs         # Modal states (Normal/Insert/Command)
-├── state.rs        # Immutable data structures (Buffer, OutputLog)
-├── command.rs      # Command parser with algebraic errors
-├── event.rs        # Event stream abstraction
-└── ui.rs           # Pure rendering logic
-```
 
-## Budowanie i uruchamianie
+## Uruchomienie
 
 ```bash
 # Kompilacja
@@ -33,8 +44,8 @@ cargo build --release
 # Uruchomienie
 cargo run
 
-# Testy
-cargo test
+# Z debugowaniem
+RUST_LOG=debug cargo run
 ```
 
 ## Interface użytkownika
@@ -42,197 +53,157 @@ cargo test
 ### Layout
 ```
 ┌────────────────────────────────┐
-│         Output Area            │  ← Scrollowalna historia wyjścia
-│                                │
-│                                │
+│         Output Area            │  ← Scrollowalna historia
+│  🔍 Debug messages             │  ← Z emoji dla czytelności
+│  📦 Response data              │
+│  ❌ Error messages             │
 ├────────────────────────────────┤
-│ MODE  Status message  Help     │  ← Status bar z kontekstem
+│ MODE  Status message  Help     │  ← Status bar
 ├────────────────────────────────┤
-│ > input buffer_                │  ← Linia wejściowa z kursorem
+│ > input buffer_               │  ← Linia wejściowa
 └────────────────────────────────┘
 ```
 
-### Tryby (Modal Editing)
+### Tryby
 
-#### **NORMAL** (niebieski)
-Domyślny tryb nawigacji.
-
-**Klawisze:**
-- `i` - przejście do trybu INSERT
-- `:` - przejście do trybu COMMAND  
+#### **NORMAL** (cyan)
+- `i` - INSERT mode
+- `:` - COMMAND mode  
 - `q` - szybkie wyjście
 - `Ctrl+Q` - wymuszenie wyjścia
-- `Ctrl+L` - czyszczenie output
+- `Ctrl+L` - czyszczenie outputu
 
-#### **INSERT** (zielony)
-Tryb wprowadzania danych do wysłania.
-
-**Klawisze:**
+#### **INSERT** (green)
 - `ESC` - powrót do NORMAL
 - `Enter` - wysłanie wejścia
-- `Ctrl+W` - czyszczenie bufora wejściowego
-- `←` / `→` - nawigacja kursorem
-- `Home` / `End` - skok do początku/końca
-- `Backspace` - usuwanie znaku
+- `Ctrl+W` - czyszczenie bufora
+- `←`/`→`/`Home`/`End` - nawigacja
 
-#### **COMMAND** (żółty)
-Tryb poleceń systemowych.
+#### **COMMAND** (yellow)
+```
+:q, :quit              - wyjście
+:clear                 - czyszczenie outputu
+:echo <text>           - echo do outputu
+:mcp connect           - wybór serwera (interaktywny)
+:mcp connect <name>    - połączenie bezpośrednie
+:mcp list              - lista skonfigurowanych serwerów
+:mcp tools             - lista narzędzi MCP
+:h, :help              - pomoc
+```
 
-**Dostępne komendy:**
-- `:q`, `:quit` - wyjście z aplikacji
-- `:clear` - wyczyszczenie outputu
-- `:echo <text>` - echo tekstu do output
-- `:help` - wyświetlenie pomocy
+#### **SELECT** (magenta)
+Tryb wyboru serwera MCP:
+- `↑`/`↓` lub `j`/`k` - nawigacja
+- `1`-`9` - wybór bezpośredni
+- `Enter` - potwierdź wybór
+- `Esc` - anuluj
 
-**Klawisze:**
-- `ESC` - anulowanie, powrót do NORMAL
-- `Enter` - wykonanie komendy
-- `Backspace` - usuwanie znaku
+## Debugowanie połączenia MCP
+
+Aplikacja wyświetla szczegółowe informacje o procesie połączenia:
+
+```
+🔌 Connecting to local-server at http://localhost:8080
+📡 Initial response: HTTP 200
+📥 Waiting for SSE endpoint...
+📨 SSE event='endpoint' data='/session/abc123'
+✅ Received endpoint: /session/abc123
+🔗 Session endpoint: http://localhost:8080/session/abc123
+🎧 Starting SSE listener on http://localhost:8080/session/abc123
+📤 Sending initialize: {...}
+📥 Initialize response: HTTP 200
+✅ MCP session initialized
+```
+
+### Typowe problemy
+
+**❌ POST HTTP error: 405 Method Not Allowed**
+- Serwer nie przyjmuje POST na danym endpointcie
+- Sprawdź czy endpoint SSE zwrócił poprawną ścieżkę sesji
+- Weryfikuj logi: `📨 SSE event='endpoint'`
+
+**⚠️ No endpoint received from server**
+- Serwer nie wysłał SSE event `endpoint`
+- Sprawdź format odpowiedzi serwera
+- Możliwe że serwer używa innego protokołu
+
+**Stream ended without endpoint**
+- Połączenie SSE zamknęło się przed wysłaniem endpointu
+- Sprawdź logi serwera MCP
+- Weryfikuj czy serwer poprawnie implementuje SSE
 
 ## Przykładowa sesja
 
 ```
-[NORMAL] Uruchomienie programu
-  ↓ i
-[INSERT] Wpisz: hello world
+[NORMAL] Start
+  ↓ :
+[COMMAND] mcp connect
   ↓ Enter
-[INSERT] → hello world
-         ← Echo: hello world
-  ↓ ESC
+[SELECT] 
+  🔌 Select MCP server:
+    → [1] local-server: http://localhost:8080
+      [2] remote-server: https://example.com/mcp
+  
+  Use ↑↓ or j/k to navigate, Enter to connect
+  ↓ Enter
 [NORMAL]
+  🔌 Connecting to local-server at http://localhost:8080
+  📡 Initial response: HTTP 200
+  📥 Waiting for SSE endpoint...
+  ✅ Received endpoint: /session/abc123
+  ✅ MCP session initialized
   ↓ :
-[COMMAND] Wpisz: echo test
+[COMMAND] mcp tools
   ↓ Enter
-[NORMAL] test
-  ↓ :
-[COMMAND] Wpisz: q
-  ↓ Enter
-[EXIT]
+[NORMAL]
+  📤 Sending tools/list (id=2)
+  📦 Available tools:
+    • read_file
+    • write_file
+    • list_directory
 ```
-
-## Funkcyjne property-testing
-
-Wszystkie moduły posiadają testy jednostkowe weryfikujące:
-- Parsowanie komend (exhaustive pattern matching)
-- Transformacje bufora (immutability)
-- Przejścia między trybami (state machine validity)
-
-```bash
-cargo test
-```
-
-## Zaawansowane techniki
-
-### 1. State Machine jako czysta funkcja
-```rust
-fn handle_event(self, event: Event) -> Result<Self>
-```
-Każda transformacja stanu to nowa wartość - brak mutacji.
-
-### 2. Algebraiczne typy błędów
-```rust
-enum CommandError {
-    Unknown(String),
-    InvalidSyntax(String),
-    Empty,
-}
-```
-Błędy jako wartości, nie wyjątki.
-
-### 3. Kompozycja renderingu
-```rust
-render(frame, app) = 
-    render_output(frame, app, area) 
-    ∘ render_status(frame, app, area)
-    ∘ render_input(frame, app, area)
-```
-
-### 4. Bounded data structures
-```rust
-const MAX_LOG_LINES: usize = 1000;
-// OutputLog automatycznie utrzymuje limit
-```
-
-## Proxy pointers
-
-Projekt używa sygnałów dojrzałości ekosystemu:
-
-1. **ratatui** - stabilny protokół TUI, aktywnie rozwijany
-2. **crossterm** - cross-platform terminal manipulation
-3. **Brak `unsafe`** - 100% bezpieczny kod bez UB
-4. **Testy unit** - każdy moduł testowany izolacyjnie
-5. **No `panic!`** - wszystkie błędy przez `Result<T, E>`
-
-## Rozszerzalność
-
-Architektura pozwala łatwo dodać:
-- Nowe komendy (extend `Command` enum)
-- Nowe tryby (extend `Mode` enum)
-- Protokół MCP (add `mcp` module)
-- Historię komend (add `History` state)
-- Autocomplete (extend command parser)
-
-Wszystko przez kompozycję, nie dziedziczenie.
-
-
-
-
-
-
-
-
-################################# PODSUMOWANIE ###########################################
-# MCP Test Client
-
-Terminal-based MCP (Model Context Protocol) client z interfejsem inspirowanym Vim.
 
 ## Architektura
 
-Projekt wykorzystuje funkcyjne wzorce projektowe i modularne podejście:
+### Funkcyjne wzorce
+- **Immutowalne transformacje stanu** - `App::handle_event(self, event) -> Result<Self>`
+- **Czyste struktury danych** - `Buffer`, `OutputLog`, `Mode`
+- **Algebraiczne typy** - `Command`, `McpClientEvent` jako enums
+- **Async event streaming** - tokio channels + SSE
 
 ### Moduły
+```
+src/
+├── main.rs         # Entry point + event loop
+├── app.rs          # State machine z server selection
+├── mcp.rs          # MCP client (SSE + JSON-RPC)
+├── command.rs      # Command parser
+├── config.rs       # Configuration loader
+├── mode.rs         # Modal states
+├── state.rs        # Immutable buffers
+├── event.rs        # Event abstraction
+└── ui.rs           # Pure rendering
+```
 
-- **`app`** - Stan aplikacji z niemutowalną logiką przejść stanów
-- **`mode`** - Tryby edytora (Normal, Insert, Command) jako typ sum
-- **`event`** - Strumień zdarzeń z klawiaturą
-- **`ui`** - Czysta funkcja renderowania UI
-- **`command`** - Parser komend z algebraicznym podejściem do błędów
-- **`mcp`** - Protokół MCP z funkcyjnym API
+## MCP Protocol Support
 
-### Tryby (Modal Editing)
+Implementowane features:
+- ✅ SSE transport
+- ✅ JSON-RPC 2.0
+- ✅ `initialize` method
+- ✅ `tools/list` method
+- ✅ Session endpoint discovery
+- ✅ Async request/response matching
+- ⏳ `tools/call` (TODO)
+- ⏳ `resources/*` (TODO)
+- ⏳ `prompts/*` (TODO)
 
-1. **NORMAL** (domyślny)
-   - `i` - przejście do trybu INSERT
-   - `:` - przejście do trybu COMMAND
-   - `Ctrl+Q` - wyjście z programu
+## Rozszerzalność
 
-2. **INSERT**
-   - Wprowadzanie tekstu
-   - `Enter` - wysłanie zapytania
-   - `Esc` - powrót do NORMAL
-   - Strzałki - poruszanie kursorem
+Dodawanie nowych komend MCP:
+1. Extend `Command` enum w `command.rs`
+2. Add parsing logic w `Command::parse()`
+3. Handle w `App::execute_command()`
+4. Implement w `McpClient`
 
-3. **COMMAND**
-   - `:q` lub `:quit` - wyjście
-   - `:connect <server>` - połączenie z serwerem MCP
-   - `:list` - lista dostępnych narzędzi
-   - `:call <tool> <args>` - wywołanie narzędzia
-   - `:clear` - czyszczenie output
-   - `Esc` - anulowanie, powrót do NORMAL
-
-
-## Zaawansowane techniki funkcyjne
-
-1. **Niemutowalność** - Stan aplikacji jest przekazywany przez transformacje, nie mutowany
-2. **Pure functions** - UI rendering i parsowanie komend są czystymi funkcjami
-3. **Algebraiczne typy danych** - Użycie enum z pattern matching
-4. **Composition over inheritance** - Moduły kompozytują funkcjonalność
-5. **Error handling jako typ** - Błędy jako wartości (`Result`, `Option`)
-
-## Filozofia projektu
-
-Kod traktuje proxy pointers jako wskaźniki dojrzałości ekosystemu:
-- Użycie `ratatui` (stabilny protokół TUI)
-- Wzorce z funkcyjnego programowania (immutability, pure functions)
-- Modularność umożliwiająca izolowane testy
-- Brak ukrytych stanów czy efektów ubocznych
+Wszystko przez kompozycję, zero dziedziczenia!

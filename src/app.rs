@@ -8,7 +8,7 @@ use anyhow::Result;
 use crossterm::event::{KeyCode, KeyModifiers};
 use tokio::sync::mpsc;
 
-/// Immutable application state with functional transitions
+/// Application state with server selection mode
 #[derive(Debug)]
 pub struct App {
     mode: Mode,
@@ -20,6 +20,14 @@ pub struct App {
     mcp_client: McpClient,
     pub mcp_event_rx: mpsc::Receiver<McpClientEvent>,
     config: Config,
+    server_selection: Option<ServerSelection>,
+    mouse_enabled: bool,
+}
+
+#[derive(Debug)]
+pub struct ServerSelection {
+    servers: Vec<String>,
+    selected: usize,
 }
 
 impl App {
@@ -38,8 +46,14 @@ impl App {
             mcp_client,
             mcp_event_rx,
             config,
+            server_selection: None,
+            mouse_enabled: true,
         }
     }
+
+    // ═══════════════════════════════════════════════════════════════
+    // Pure accessors (no side effects)
+    // ═══════════════════════════════════════════════════════════════
 
     pub const fn mode(&self) -> Mode {
         self.mode
@@ -73,6 +87,19 @@ impl App {
         self.quit
     }
 
+    pub fn server_selection(&self) -> Option<&ServerSelection> {
+        self.server_selection.as_ref()
+    }
+
+    pub const fn mouse_enabled(&self) -> bool {
+        self.mouse_enabled
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // Event handler: Self → Event → Result<Self>
+    // Core functional transformation
+    // ═══════════════════════════════════════════════════════════════
+
     pub async fn handle_event(mut self, event: Event) -> Result<Self> {
         match event {
             Event::Key(key) => self.handle_key(key.code, key.modifiers).await,
@@ -95,22 +122,30 @@ impl App {
                 self.status = "MCP client disconnected".into();
             }
             McpClientEvent::Message(msg) => {
-                self.output = self.output.with_message(format!("[MCP] {}", msg));
+                self.output = self.output.with_message(msg);
             }
             McpClientEvent::Error(err) => {
-                self.output = self.output.with_message(format!("[MCP Error] {}", err));
+                self.output = self.output.with_message(format!("❌ [MCP Error] {}", err));
             }
             McpClientEvent::ToolsListed(tools) => {
-                self.output = self.output.with_message("Available tools:".to_string());
+                self.output = self.output.with_message("📦 Available tools:".to_string());
                 for tool in tools {
-                    self.output = self.output.with_message(format!("  - {}", tool));
+                    self.output = self.output.with_message(format!("  • {}", tool));
                 }
+            }
+            McpClientEvent::Debug(msg) => {
+                self.output = self.output.with_message(format!("🔍 {}", msg));
             }
         }
         Ok(self)
     }
 
-    async fn handle_key(self, code: KeyCode, mods: KeyModifiers) -> Result<Self> {
+    async fn handle_key(mut self, code: KeyCode, mods: KeyModifiers) -> Result<Self> {
+        // Server selection mode has priority
+        if self.server_selection.is_some() {
+            return self.handle_server_selection_key(code).await;
+        }
+
         if mods.contains(KeyModifiers::CONTROL) {
             return self.handle_ctrl_key(code).await;
         }
@@ -121,6 +156,68 @@ impl App {
             Mode::Command => self.handle_command_key(code).await,
         }
     }
+
+    // ═══════════════════════════════════════════════════════════════
+    // Server selection mode
+    // ═══════════════════════════════════════════════════════════════
+
+    async fn handle_server_selection_key(mut self, code: KeyCode) -> Result<Self> {
+        let (selected, servers) = match &mut self.server_selection {
+            Some(s) => (s.selected, s.servers.clone()),
+            None => return Ok(self),
+        };
+
+        match code {
+            KeyCode::Esc => {
+                self.server_selection = None;
+                self.status = "Server selection cancelled".into();
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(selection) = &mut self.server_selection {
+                if selection.selected > 0 {
+                    selection.selected -= 1;
+                }
+            }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(selection) = &mut self.server_selection {
+                if selection.selected < selection.servers.len() - 1 {
+                    selection.selected += 1;
+                }
+            }
+            }
+            KeyCode::Enter => {
+                let server_name = servers[selected].clone();
+                self.server_selection = None;
+
+                if let Some(server) = self.config.mcp_servers.iter().find(|s| s.name == server_name) {
+                    self.status = format!("Connecting to {}...", server.name);
+                    self.mcp_client.connect(server.url.clone(), server.name.clone()).await;
+                } else {
+                    self.status = format!("Server '{}' not found", server_name);
+                }
+            }
+            KeyCode::Char(c) if c.is_ascii_digit() => {
+                let idx = c.to_digit(10).unwrap() as usize;
+                if idx > 0 && idx <= servers.len() {
+                    let server_name = servers[idx - 1].clone();
+                    self.server_selection = None;
+
+                    if let Some(server) = self.config.mcp_servers.iter().find(|s| s.name == server_name) {
+                        self.status = format!("Connecting to {}...", server.name);
+                        self.mcp_client.connect(server.url.clone(), server.name.clone()).await;
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        Ok(self)
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // Mode: NORMAL
+    // ═══════════════════════════════════════════════════════════════
 
     async fn handle_normal_key(mut self, code: KeyCode) -> Result<Self> {
         match code {
@@ -140,6 +237,10 @@ impl App {
         }
         Ok(self)
     }
+
+    // ═══════════════════════════════════════════════════════════════
+    // Mode: INSERT
+    // ═══════════════════════════════════════════════════════════════
 
     async fn handle_insert_key(mut self, code: KeyCode) -> Result<Self> {
         match code {
@@ -181,6 +282,10 @@ impl App {
         Ok(self)
     }
 
+    // ═══════════════════════════════════════════════════════════════
+    // Mode: COMMAND
+    // ═══════════════════════════════════════════════════════════════
+
     async fn handle_command_key(mut self, code: KeyCode) -> Result<Self> {
         match code {
             KeyCode::Esc => {
@@ -208,6 +313,10 @@ impl App {
         }
     }
 
+    // ═══════════════════════════════════════════════════════════════
+    // Control key handlers
+    // ═══════════════════════════════════════════════════════════════
+
     async fn handle_ctrl_key(mut self, code: KeyCode) -> Result<Self> {
         match code {
             KeyCode::Char('q') => {
@@ -226,6 +335,10 @@ impl App {
         Ok(self)
     }
 
+    // ═══════════════════════════════════════════════════════════════
+    // Command execution
+    // ═══════════════════════════════════════════════════════════════
+
     async fn execute_command(mut self, text: &str) -> Result<Self> {
         match Command::parse(text) {
             Ok(Command::Quit) => {
@@ -242,43 +355,82 @@ impl App {
             }
             Ok(Command::Help) => {
                 self.output = self.output
-                    .with_message("Available commands:".to_string())
+                    .with_message("📚 Available commands:".to_string())
                     .with_message("  :q, :quit                - Exit application".to_string())
                     .with_message("  :clear                   - Clear output".to_string())
                     .with_message("  :echo <text>             - Echo text to output".to_string())
+                    .with_message("  :mouse on/off            - Enable/disable mouse capture".to_string())
                     .with_message("  :mcp list                - List configured MCP servers".to_string())
                     .with_message("  :mcp tools               - List tools of connected MCP server".to_string())
-                    .with_message("  :mcp cn, :mcp connect    - Connect to MCP server".to_string())
+                    .with_message("  :mcp cn, :mcp connect    - Connect to MCP server (interactive)".to_string())
                     .with_message("  :h, :help                - Show this help".to_string());
                 self.status = "Help displayed".into();
             }
             Ok(Command::McpConnect(server_name)) => {
                 if let Some(name) = server_name {
+                    // Direct connection by name
                     if let Some(server) = self.config.mcp_servers.iter().find(|s| s.name == name) {
-                        self.status = format!("Connecting to {}...", server.url);
+                        self.status = format!("Connecting to {}...", server.name);
                         self.mcp_client.connect(server.url.clone(), server.name.clone()).await;
                     } else {
                         self.status = format!("Server '{}' not found in config.json", name);
                     }
                 } else {
-                    self.output = self.output.with_message("Available MCP servers:".to_string());
+                    // Interactive selection
+                    if self.config.mcp_servers.is_empty() {
+                        self.output = self.output.with_message("No MCP servers configured in config.json".to_string());
+                    } else {
+                        let servers: Vec<String> = self.config.mcp_servers.iter().map(|s| s.name.clone()).collect();
+                        
+                        self.output = self.output.with_message("🔌 Select MCP server:".to_string());
                     for (i, server) in self.config.mcp_servers.iter().enumerate() {
-                        self.output = self.output.with_message(format!("  [{}] {}: {}", i + 1, server.name, server.url));
+                            let prefix = if i == 0 { "→" } else { " " };
+                            self.output = self.output.with_message(
+                                format!("  {} [{}] {}: {}", prefix, i + 1, server.name, server.url)
+                            );
                     }
-                    self.output = self.output.with_message("Usage: :mcp connect [server_name|server_number]".to_string());
+                        self.output = self.output
+                            .with_message("".to_string())
+                            .with_message("Use ↑↓ or j/k to navigate, Enter to connect, Esc to cancel".to_string());
+
+                        self.server_selection = Some(ServerSelection {
+                            servers,
+                            selected: 0,
+                        });
+                        self.status = "Select server with ↑↓ or number keys".into();
+                    }
                 }
             }
             Ok(Command::McpList) => {
-                self.output = self.output.with_message("Configured MCP servers:".to_string());
+                self.output = self.output.with_message("📋 Configured MCP servers:".to_string());
+                if self.config.mcp_servers.is_empty() {
+                    self.output = self.output.with_message("  (none)".to_string());
+                } else {
                 for server in &self.config.mcp_servers {
                     self.output = self
                         .output
-                        .with_message(format!("  - {}: {}", server.name, server.url));
+                            .with_message(format!("  • {}: {}", server.name, server.url));
+                    }
                 }
             }
             Ok(Command::McpTools) => {
                 self.status = "Listing tools...".to_string();
                 self.mcp_client.list_tools().await;
+            }
+            Ok(Command::Mouse(enabled)) => {
+                self.mouse_enabled = enabled;
+                let state = if enabled { "enabled" } else { "disabled" };
+                self.output = self.output.with_message(
+                    format!("🖱️  Mouse capture {}", state)
+                );
+                self.output = self.output.with_message(
+                    if enabled {
+                        "Mouse events captured by application. Terminal selection disabled.".to_string()
+                    } else {
+                        "Mouse capture disabled. You can now use terminal selection (Ctrl+Shift+C to copy).".to_string()
+                    }
+                );
+                self.status = format!("Mouse capture {}", state);
             }
             Err(e) => {
                 self.status = format!("Error: {}", e);
@@ -292,5 +444,15 @@ impl Default for App {
     fn default() -> Self {
         let config = Config::from_file("config.json").unwrap();
         Self::new(config)
+    }
+}
+
+impl ServerSelection {
+    pub fn servers(&self) -> &[String] {
+        &self.servers
+    }
+
+    pub fn selected(&self) -> usize {
+        self.selected
     }
 }

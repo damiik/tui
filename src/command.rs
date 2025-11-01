@@ -19,6 +19,7 @@ pub enum Command {
     McpConnect(Option<String>),
     McpList,
     McpTools,
+    Mouse(bool), // true = on, false = off
 }
 
 impl Command {
@@ -52,6 +53,8 @@ impl Command {
             }
             ["mcp", "list"] => Ok(Command::McpList),
             ["mcp", "tools"] => Ok(Command::McpTools),
+            ["mouse", "on"] => Ok(Command::Mouse(true)),
+            ["mouse", "off"] => Ok(Command::Mouse(false)),
             [cmd, ..] => Err(CommandError::Unknown(cmd.to_string())),
             [] => unreachable!(), // Already handled empty case
         }
@@ -143,5 +146,11 @@ mod tests {
     #[test]
     fn test_mcp_tools_command() {
         assert_eq!(Command::parse("mcp tools"), Ok(Command::McpTools));
+    }
+
+    #[test]
+    fn test_mouse_commands() {
+        assert_eq!(Command::parse("mouse on"), Ok(Command::Mouse(true)));
+        assert_eq!(Command::parse("mouse off"), Ok(Command::Mouse(false)));
     }
 }

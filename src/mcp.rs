@@ -19,6 +19,7 @@ pub enum McpClientEvent {
     Message(String),
     Error(String),
     ToolsListed(Vec<String>),
+    Debug(String),
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -32,7 +33,7 @@ pub struct McpClient {
     base_url: Option<String>,
     session_endpoint: Arc<Mutex<Option<String>>>,
     pending: Arc<Mutex<HashMap<i64, oneshot::Sender<serde_json::Value>>>>,
-    next_id: AtomicI64,
+    next_id: Arc<AtomicI64>,
     sse_shutdown: Arc<Mutex<Option<oneshot::Sender<()>>>>,
 }
 
@@ -44,12 +45,12 @@ impl McpClient {
             base_url: None,
             session_endpoint: Arc::new(Mutex::new(None)),
             pending: Arc::new(Mutex::new(HashMap::new())),
-            next_id: AtomicI64::new(1),
+            next_id: Arc::new(AtomicI64::new(1)),
             sse_shutdown: Arc::new(Mutex::new(None)),
         }
     }
 
-    pub async fn connect(&mut self, url: String, _server_name: String) {
+    pub async fn connect(&mut self, url: String, server_name: String) {
         self.base_url = Some(url.clone());
 
         let event_tx = self.event_tx.clone();
@@ -57,30 +58,37 @@ impl McpClient {
         let session_endpoint = self.session_endpoint.clone();
         let pending = self.pending.clone();
         let sse_shutdown = self.sse_shutdown.clone();
-        let next_id_arc = Arc::new(AtomicI64::new(self.next_id.load(Ordering::SeqCst)));
+        let next_id = self.next_id.clone();
 
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
         *sse_shutdown.lock().await = Some(shutdown_tx);
 
         tokio::spawn(async move {
-            let mut attempt = 0;
-            loop {
-                attempt += 1;
+            let _ = event_tx.send(McpClientEvent::Debug(
+                format!("🔌 Connecting to {} at {}", server_name, url)
+            )).await;
 
                 match client.get(&url).send().await {
                     Ok(response) => {
+                    let _ = event_tx.send(McpClientEvent::Debug(
+                        format!("📡 Initial response: HTTP {}", response.status())
+                    )).await;
+
                         if !response.status().is_success() {
                             let _ = event_tx.send(McpClientEvent::Error(
-                                format!("HTTP connect: {}", response.status()),
+                            format!("HTTP connect failed: {}", response.status()),
                             )).await;
-                            sleep(Duration::from_millis(200)).await;
-                            continue;
+                        return;
                         }
 
                         let _ = event_tx.send(McpClientEvent::Connected).await;
                         let mut stream = response.bytes_stream();
                         let mut buf = String::new();
                         let mut endpoint: Option<String> = None;
+
+                    let _ = event_tx.send(McpClientEvent::Debug(
+                        "📥 Waiting for SSE endpoint...".to_string()
+                    )).await;
 
                         // Parse SSE stream to extract endpoint
                         loop {
@@ -104,9 +112,13 @@ impl McpClient {
                                                 let block = buf[..split].to_string();
                                                 buf = buf[split + 2..].to_string();
 
+                                            let mut event_type = String::new();
                                                 let mut data = String::new();
+
                                                 for line in block.lines() {
-                                                    if let Some(rest) = line.strip_prefix("data:") {
+                                                if let Some(rest) = line.strip_prefix("event:") {
+                                                    event_type = rest.trim().to_string();
+                                                } else if let Some(rest) = line.strip_prefix("data:") {
                                                         if !data.is_empty() {
                                                             data.push('\n');
                                                         }
@@ -118,21 +130,25 @@ impl McpClient {
                                                     continue;
                                                 }
 
+                                            let _ = event_tx.send(McpClientEvent::Debug(
+                                                format!("📨 SSE event='{}' data='{}'", event_type, data)
+                                            )).await;
+
                                                 // Check for endpoint announcement
-                                                if let Some(ep) = data
-                                                    .strip_prefix("event: endpoint")
-                                                    .or_else(|| data.strip_prefix("endpoint"))
-                                                {
-                                                    let ep = ep.trim().to_string();
-                                                    if !ep.is_empty() {
-                                                        endpoint = Some(ep);
+                                            if event_type == "endpoint" {
+                                                endpoint = Some(data.clone());
+                                                let _ = event_tx.send(McpClientEvent::Debug(
+                                                    format!("✅ Received endpoint: {}", data)
+                                                )).await;
                                                         break;
                                                     }
-                                                }
 
                                                 // Try parsing as JSON-RPC
                                                 match serde_json::from_str::<serde_json::Value>(&data) {
                                                     Ok(v) => {
+                                                    let _ = event_tx.send(McpClientEvent::Debug(
+                                                        format!("📦 JSON-RPC: {}", serde_json::to_string(&v).unwrap_or_default())
+                                                    )).await;
                                                         handle_json_rpc_event(v, &event_tx, &pending).await;
                                                     }
                                                     Err(_) => {
@@ -155,7 +171,12 @@ impl McpClient {
                                             break;
                                         }
 
-                                        None => break,
+                                    None => {
+                                        let _ = event_tx.send(McpClientEvent::Debug(
+                                            "⚠️ Stream ended without endpoint".to_string()
+                                        )).await;
+                                        break;
+                                    }
                                     }
                                 }
                             }
@@ -167,8 +188,7 @@ impl McpClient {
                                 let _ = event_tx.send(McpClientEvent::Error(
                                     "No endpoint received from server".into()
                                 )).await;
-                                sleep(Duration::from_millis(500)).await;
-                                continue;
+                            return;
                             }
                         };
 
@@ -179,6 +199,10 @@ impl McpClient {
                         }
 
                         let full_url = join_url(&url, &endpoint);
+                        let post_url = full_url.clone();
+                    let _ = event_tx.send(McpClientEvent::Debug(
+                        format!("🔗 Session endpoint: {}", full_url)
+                    )).await;
 
                         // Spawn SSE listener task
                         let sse_client = client.clone();
@@ -187,12 +211,11 @@ impl McpClient {
                         let sse_pending = pending.clone();
                         let (sse_shutdown_tx, sse_shutdown_rx) = oneshot::channel();
 
-                        // Store new shutdown handle
                         *sse_shutdown.lock().await = Some(sse_shutdown_tx);
 
                         tokio::spawn(async move {
-                            let _ = sse_event_tx.send(McpClientEvent::Message(
-                                format!("SSE started: {}", full_url)
+                        let _ = sse_event_tx.send(McpClientEvent::Debug(
+                            format!("🎧 Starting SSE listener on {}", full_url)
                             )).await;
 
                             sse_stream_loop(
@@ -205,8 +228,11 @@ impl McpClient {
                             ).await;
                         });
 
+                    // Wait a bit for SSE to stabilize
+                    sleep(Duration::from_millis(100)).await;
+
                         // Send initialize request
-                        let id = next_id_arc.fetch_add(1, Ordering::SeqCst);
+                    let id = next_id.fetch_add(1, Ordering::SeqCst);
                         let init = json!({
                             "jsonrpc": "2.0",
                             "id": id,
@@ -221,28 +247,53 @@ impl McpClient {
                             }
                         });
 
-                        let _ = client.post(join_url(&url, &endpoint))
+                    let _ = event_tx.send(McpClientEvent::Debug(
+                        format!("📤 Sending initialize: {}", serde_json::to_string(&init).unwrap_or_default())
+                    )).await;
+
+                    match client.post(&post_url)
                             .header("Content-Type", "application/json")
                             .body(init.to_string())
                             .send()
-                            .await;
+                        .await
+                    {
+                        Ok(resp) => {
+                            let _ = event_tx.send(McpClientEvent::Debug(
+                                format!("📥 Initialize response: HTTP {}", resp.status())
+                            )).await;
 
-                        break;
+                            if resp.status().is_success() {
+                                if let Ok(body) = resp.text().await {
+                                    let _ = event_tx.send(McpClientEvent::Debug(
+                                        format!("📄 Initialize body: {}", body)
+                                    )).await;
+                                }
+                                let _ = event_tx.send(McpClientEvent::Message(
+                                    "✅ MCP session initialized".to_string()
+                                )).await;
+                            } else {
+                                let _ = event_tx.send(McpClientEvent::Error(
+                                    format!("Initialize failed: {}", resp.status())
+                                )).await;
+                            }
                     }
                     Err(e) => {
                         let _ = event_tx.send(McpClientEvent::Error(
-                            format!("Connect error (attempt {}): {}", attempt, e)
+                                format!("Initialize request failed: {}", e)
                         )).await;
-                        sleep(Duration::from_millis(500)).await;
-                        continue;
+                        }
                     }
+                }
+                Err(e) => {
+                    let _ = event_tx.send(McpClientEvent::Error(
+                        format!("Connect error: {}", e)
+                    )).await;
                 }
             }
         });
     }
 
     pub async fn list_tools(&self) {
-        if let Some(url) = &self.base_url {
             let id = self.next_id.fetch_add(1, Ordering::SeqCst);
 
             let req = json!({
@@ -252,16 +303,15 @@ impl McpClient {
                 "params": {}
             });
 
+        let _ = self.event_tx.send(McpClientEvent::Debug(
+            format!("📤 Sending tools/list (id={}): {}", id, serde_json::to_string(&req).unwrap_or_default())
+        )).await;
+
             if let Err(e) = self.send_jsonrpc(req, Some(id)).await {
                 let _ = self.event_tx.send(
                     McpClientEvent::Error(format!("list_tools send: {}", e))
                 ).await;
             }
-        } else {
-            let _ = self.event_tx.send(
-                McpClientEvent::Error("Not connected to an MCP server.".to_string())
-            ).await;
-        }
     }
 
     async fn send_jsonrpc(
@@ -271,7 +321,7 @@ impl McpClient {
     ) -> Result<(), String> {
         let base = match &self.base_url {
             Some(b) => b.clone(),
-            None => return Err("Not connected to an MCP server.".into()),
+            None => return Err("No base URL".into()),
         };
 
         let ep = {
@@ -279,10 +329,25 @@ impl McpClient {
             lock.clone()
         };
 
-        let url = match ep {
-            Some(ep) => join_url(&base, &ep),
-            None => base,
+        let endpoint_str = match &ep {
+            Some(e) => e.clone(),
+            None => {
+                let _ = self.event_tx.send(McpClientEvent::Debug(
+                    "⚠️ No session endpoint, using base URL for request".to_string()
+                )).await;
+                String::new()
+            }
         };
+
+        let url = if endpoint_str.is_empty() {
+            base.clone()
+        } else {
+            join_url(&base, &endpoint_str)
+        };
+
+        let _ = self.event_tx.send(McpClientEvent::Debug(
+            format!("🌐 POST to: {}", url)
+        )).await;
 
         if let Some(id) = expect_id {
             let (tx, _) = oneshot::channel::<serde_json::Value>();
@@ -297,8 +362,23 @@ impl McpClient {
             .await;
 
         match resp {
-            Ok(r) if r.status().is_success() => Ok(()),
-            Ok(r) => Err(format!("POST HTTP error: {}", r.status())),
+            Ok(r) => {
+                let status = r.status();
+                let _ = self.event_tx.send(McpClientEvent::Debug(
+                    format!("📥 Response: HTTP {}", status)
+                )).await;
+
+                if status.is_success() {
+                    if let Ok(body) = r.text().await {
+                        let _ = self.event_tx.send(McpClientEvent::Debug(
+                            format!("📄 Response body: {}", body)
+                        )).await;
+                    }
+                    Ok(())
+                } else {
+                    Err(format!("POST HTTP error: {}", status))
+                }
+            }
             Err(e) => Err(format!("POST error: {}", e)),
         }
     }
