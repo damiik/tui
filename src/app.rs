@@ -24,6 +24,8 @@ pub struct App {
     tool_selection: Option<ToolSelection>,
     mouse_enabled: bool,
     available_tools: Vec<ToolInfo>,
+    scroll_offset: u16,
+    autoscroll: bool,
 }
 
 #[derive(Debug)]
@@ -58,6 +60,41 @@ impl App {
             tool_selection: None,
             mouse_enabled: true,
             available_tools: Vec::new(),
+            scroll_offset: 0,
+            autoscroll: true,
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // Scrolling methods
+    // ═══════════════════════════════════════════════════════════════
+
+    fn enable_autoscroll(&mut self) {
+        self.autoscroll = true;
+        self.scroll_to_bottom();
+    }
+
+    fn disable_autoscroll(&mut self) {
+        self.autoscroll = false;
+    }
+
+    fn scroll_to_bottom(&mut self) {
+        if self.autoscroll {
+            let max_offset = self.output.lines().len().saturating_sub(1) as u16;
+            self.scroll_offset = max_offset;
+        }
+    }
+
+    fn scroll_up(&mut self) {
+        self.disable_autoscroll();
+        self.scroll_offset = self.scroll_offset.saturating_sub(1);
+    }
+
+    fn scroll_down(&mut self) {
+        self.disable_autoscroll();
+        let max_offset = self.output.lines().len().saturating_sub(1) as u16;
+        if self.scroll_offset < max_offset {
+            self.scroll_offset += 1;
         }
     }
 
@@ -71,6 +108,10 @@ impl App {
 
     pub fn output(&self) -> &[String] {
         self.output.lines()
+    }
+
+    pub const fn scroll_offset(&self) -> u16 {
+        self.scroll_offset
     }
 
     pub fn input_buffer(&self) -> &str {
@@ -139,9 +180,11 @@ impl App {
             }
             McpClientEvent::Message(msg) => {
                 self.output = self.output.with_message(msg);
+                self.scroll_to_bottom();
             }
             McpClientEvent::Error(err) => {
                 self.output = self.output.with_message(format!("❌ [MCP Error] {}", err));
+                self.scroll_to_bottom();
             }
             McpClientEvent::ToolsListed(tools) => {
                 // CRITICAL: Store tools in App state FIRST
@@ -164,11 +207,13 @@ impl App {
                 self.output = self.output.with_message(
                     format!("Total: {} tools available - use :mcp tools or :mcp run", tools.len())
                 );
+                self.scroll_to_bottom();
                 
                 self.status = format!("Loaded {} tools", tools.len());
             }
             McpClientEvent::Debug(msg) => {
                 self.output = self.output.with_message(format!("🔍 {}", msg));
+                self.scroll_to_bottom();
             }
         }
         Ok(self)
@@ -326,6 +371,15 @@ impl App {
             KeyCode::Char('q') => {
                 self.quit = true;
             }
+            KeyCode::PageUp => {
+                self.scroll_up();
+            }
+            KeyCode::PageDown => {
+                self.scroll_down();
+            }
+            KeyCode::End => {
+                self.enable_autoscroll();
+            }
             _ => {}
         }
         Ok(self)
@@ -348,6 +402,7 @@ impl App {
                         .output
                         .with_message(format!("→ {}", input))
                         .with_message(format!("← Echo: {}", input));
+                    self.scroll_to_bottom();
                     self.input_buffer = Buffer::new();
                     self.status = format!("Sent: {}", input);
                 }
@@ -421,6 +476,7 @@ impl App {
             }
             KeyCode::Char('l') => {
                 self.output = OutputLog::new();
+                self.scroll_to_bottom();
                 self.status = "Output cleared".into();
             }
             _ => {}
@@ -440,10 +496,12 @@ impl App {
             }
             Ok(Command::Clear) => {
                 self.output = OutputLog::new();
+                self.scroll_to_bottom();
                 self.status = "Output cleared".into();
             }
             Ok(Command::Echo(msg)) => {
                 self.output = self.output.with_message(msg.clone());
+                self.scroll_to_bottom();
                 self.status = format!("Echoed: {}", msg);
             }
             Ok(Command::Help) => {
@@ -462,6 +520,7 @@ impl App {
                     .with_message("  :mcp run [tool_name]     - Run MCP tool (interactive or direct)".to_string())
                     .with_message("".to_string())
                     .with_message("  :h, :help                - Show this help".to_string());
+                self.scroll_to_bottom();
                 self.status = "Help displayed".into();
             }
             Ok(Command::McpConnect(server_name)) => {
@@ -497,6 +556,7 @@ impl App {
                         });
                         self.status = "Select server with ↑↓ or number keys".into();
                     }
+                    self.scroll_to_bottom();
                 }
             }
             Ok(Command::McpList) => {
@@ -510,6 +570,7 @@ impl App {
                             .with_message(format!("  • {}: {}", server.name, server.url));
                     }
                 }
+                self.scroll_to_bottom();
             }
             Ok(Command::McpTools) => {
                 if self.available_tools.is_empty() {
@@ -535,6 +596,7 @@ impl App {
                         format!("Total: {} tools - use :mcp run to execute", self.available_tools.len())
                     );
                 }
+                self.scroll_to_bottom();
             }
             Ok(Command::McpStatus) => {
                 self.output = self.output.with_message("📊 MCP Client Status:".to_string());
@@ -561,6 +623,7 @@ impl App {
                         );
                     }
                 }
+                self.scroll_to_bottom();
                 self.status = "Status displayed".into();
             }
             Ok(Command::McpRun(tool_name)) => {
@@ -600,6 +663,7 @@ impl App {
                     });
                     self.status = "Select tool with ↑↓ or number keys".into();
                 }
+                self.scroll_to_bottom();
             }
             Ok(Command::Mouse(enabled)) => {
                 self.mouse_enabled = enabled;
@@ -614,6 +678,7 @@ impl App {
                         "Mouse capture disabled. You can now use terminal selection (Ctrl+Shift+C to copy).".to_string()
                     }
                 );
+                self.scroll_to_bottom();
                 self.status = format!("Mouse capture {}", state);
             }
             Err(e) => {

@@ -9,13 +9,12 @@ use ratatui::{
 };
 
 /// Pure UI rendering logic - no side effects
-pub struct UI {
-    scroll_offset: usize,
-}
+#[derive(Default)]
+pub struct UI;
 
 impl UI {
     pub const fn new() -> Self {
-        Self { scroll_offset: 0 }
+        Self
     }
 
     /// Pure function: Frame × App → ()
@@ -72,19 +71,20 @@ impl UI {
         let paragraph = Paragraph::new(lines)
             .block(block)
             .wrap(Wrap { trim: false })
-            .scroll((self.scroll_offset as u16, 0));
+            .scroll((app.scroll_offset(), 0));
 
         frame.render_widget(paragraph, area);
 
         // Render scrollbar if content exceeds visible area
-        if app.output().len() > area.height as usize - 2 {
+        let content_length = app.output().len();
+        if content_length > area.height as usize - 2 {
             let scrollbar = Scrollbar::default()
                 .orientation(ScrollbarOrientation::VerticalRight)
                 .begin_symbol(Some("↑"))
                 .end_symbol(Some("↓"));
 
-            let mut scrollbar_state = ScrollbarState::new(app.output().len())
-                .position(self.scroll_offset);
+            let mut scrollbar_state = ScrollbarState::new(content_length)
+                .position(app.scroll_offset() as usize);
 
             frame.render_stateful_widget(
                 scrollbar,
@@ -198,11 +198,7 @@ impl UI {
     }
 }
 
-impl Default for UI {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+
 
 // ═══════════════════════════════════════════════════════════════
 // Layout helper structure
