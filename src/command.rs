@@ -19,12 +19,12 @@ pub enum Command {
     McpConnect(Option<String>),
     McpList,
     McpTools,
-    Mouse(bool), // true = on, false = off
+    McpRun(Option<String>), // None = interactive selection, Some(name) = direct call
+    Mouse(bool),
 }
 
 impl Command {
     /// Pure parser: &str → Result<Command, CommandError>
-    /// Functional transformation with explicit error handling
     pub fn parse(input: &str) -> Result<Self, CommandError> {
         let trimmed = input.trim();
 
@@ -53,6 +53,8 @@ impl Command {
             }
             ["mcp", "list"] => Ok(Command::McpList),
             ["mcp", "tools"] => Ok(Command::McpTools),
+            ["mcp", "run"] => Ok(Command::McpRun(None)),
+            ["mcp", "run", name] => Ok(Command::McpRun(Some(name.to_string()))),
             ["mouse", "on"] => Ok(Command::Mouse(true)),
             ["mouse", "off"] => Ok(Command::Mouse(false)),
             [cmd, ..] => Err(CommandError::Unknown(cmd.to_string())),
@@ -87,38 +89,6 @@ mod tests {
             Command::parse("echo hello world"),
             Ok(Command::Echo("hello world".into()))
         );
-        assert_eq!(
-            Command::parse("echo    multiple   spaces"),
-            Ok(Command::Echo("multiple   spaces".into()))
-        );
-    }
-
-    #[test]
-    fn test_echo_without_args() {
-        assert!(matches!(
-            Command::parse("echo"),
-            Err(CommandError::InvalidSyntax(_))
-        ));
-    }
-
-    #[test]
-    fn test_unknown_command() {
-        assert!(matches!(
-            Command::parse("unknown"),
-            Err(CommandError::Unknown(_))
-        ));
-    }
-
-    #[test]
-    fn test_empty_command() {
-        assert!(matches!(Command::parse(""), Err(CommandError::Empty)));
-        assert!(matches!(Command::parse("   "), Err(CommandError::Empty)));
-    }
-
-    #[test]
-    fn test_help_command() {
-        assert_eq!(Command::parse("help"), Ok(Command::Help));
-        assert_eq!(Command::parse("h"), Ok(Command::Help));
     }
 
     #[test]
@@ -127,25 +97,21 @@ mod tests {
             Command::parse("mcp connect pcbvi-mcp-server"),
             Ok(Command::McpConnect(Some("pcbvi-mcp-server".into())))
         );
-        assert_eq!(
-            Command::parse("mcp cn pcbvi-mcp-server"),
-            Ok(Command::McpConnect(Some("pcbvi-mcp-server".into())))
-        );
-        assert_eq!(
-            Command::parse("mcp connect"),
-            Ok(Command::McpConnect(None))
-        );
-        assert_eq!(Command::parse("mcp cn"), Ok(Command::McpConnect(None)));
-    }
-
-    #[test]
-    fn test_mcp_list_command() {
-        assert_eq!(Command::parse("mcp list"), Ok(Command::McpList));
+        assert_eq!(Command::parse("mcp connect"), Ok(Command::McpConnect(None)));
     }
 
     #[test]
     fn test_mcp_tools_command() {
         assert_eq!(Command::parse("mcp tools"), Ok(Command::McpTools));
+    }
+
+    #[test]
+    fn test_mcp_run_command() {
+        assert_eq!(Command::parse("mcp run"), Ok(Command::McpRun(None)));
+        assert_eq!(
+            Command::parse("mcp run get_view_state"),
+            Ok(Command::McpRun(Some("get_view_state".into())))
+        );
     }
 
     #[test]

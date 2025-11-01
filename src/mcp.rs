@@ -10,7 +10,20 @@ use tokio::time::sleep;
 
 // ═══════════════════════════════════════════════════════════════
 // EVENTS
-// ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+pub struct ToolInfo {
+    pub name: String,
+    pub description: String,
+    pub input_schema: serde_json::Value,
+}
+
+impl std::fmt::Display for ToolInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.name, self.description)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum McpClientEvent {
@@ -18,7 +31,7 @@ pub enum McpClientEvent {
     Disconnected,
     Message(String),
     Error(String),
-    ToolsListed(Vec<String>),
+    ToolsListed(Vec<ToolInfo>),
     Debug(String),
 }
 
@@ -35,6 +48,7 @@ pub struct McpClient {
     pending: Arc<Mutex<HashMap<i64, oneshot::Sender<serde_json::Value>>>>,
     next_id: Arc<AtomicI64>,
     sse_shutdown: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    available_tools: Arc<Mutex<Vec<ToolInfo>>>,
 }
 
 impl McpClient {
@@ -47,6 +61,7 @@ impl McpClient {
             pending: Arc::new(Mutex::new(HashMap::new())),
             next_id: Arc::new(AtomicI64::new(1)),
             sse_shutdown: Arc::new(Mutex::new(None)),
+            available_tools: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -59,6 +74,7 @@ impl McpClient {
         let pending = self.pending.clone();
         let sse_shutdown = self.sse_shutdown.clone();
         let next_id = self.next_id.clone();
+        let available_tools = self.available_tools.clone();
 
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
         *sse_shutdown.lock().await = Some(shutdown_tx);
@@ -92,6 +108,7 @@ impl McpClient {
                         session_endpoint.clone(),
                         pending.clone(),
                         next_id.clone(),
+                        available_tools.clone(),
                         shutdown_rx,
                                             ).await;
                 }
@@ -115,7 +132,7 @@ impl McpClient {
             });
 
         let _ = self.event_tx.send(McpClientEvent::Debug(
-            format!("📤 Sending tools/list (id={}): {}", id, serde_json::to_string(&req).unwrap_or_default())
+            format!("📤 Sending tools/list (id={})", id)
         )).await;
 
             if let Err(e) = self.send_jsonrpc(req, Some(id)).await {
@@ -123,6 +140,34 @@ impl McpClient {
                     McpClientEvent::Error(format!("list_tools send: {}", e))
                 ).await;
             }
+    }
+
+    pub async fn call_tool(&self, tool_name: String, arguments: serde_json::Value) {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {
+                "name": tool_name,
+                "arguments": arguments
+            }
+        });
+
+        let _ = self.event_tx.send(McpClientEvent::Debug(
+            format!("📤 Calling tool '{}' (id={})", tool_name, id)
+        )).await;
+
+        if let Err(e) = self.send_jsonrpc(req, Some(id)).await {
+            let _ = self.event_tx.send(
+                McpClientEvent::Error(format!("call_tool send: {}", e))
+            ).await;
+        }
+    }
+
+    pub async fn get_available_tools(&self) -> Vec<ToolInfo> {
+        self.available_tools.lock().await.clone()
     }
 
     async fn send_jsonrpc(
@@ -156,10 +201,6 @@ impl McpClient {
             join_url(&base, &endpoint_str)
         };
 
-        let _ = self.event_tx.send(McpClientEvent::Debug(
-            format!("🌐 POST to: {}", url)
-        )).await;
-
         if let Some(id) = expect_id {
             let (tx, _) = oneshot::channel::<serde_json::Value>();
             self.pending.lock().await.insert(id, tx);
@@ -175,15 +216,8 @@ impl McpClient {
         match resp {
             Ok(r) => {
                 let status = r.status();
-                let _ = self.event_tx.send(McpClientEvent::Debug(
-                    format!("📥 Response: HTTP {}", status)
-                )).await;
 
-                // HTTP 202 Accepted jest poprawny - odpowiedź przyjdzie przez SSE
                 if status.is_success() || status.as_u16() == 202 {
-                    let _ = self.event_tx.send(McpClientEvent::Debug(
-                        "✅ Request accepted, awaiting SSE response".to_string()
-                    )).await;
                     Ok(())
                 } else {
                     if let Ok(body) = r.text().await {
@@ -200,7 +234,7 @@ impl McpClient {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// SSE LISTENER LOOP - KLUCZOWA FUNKCJA
+// SSE LISTENER LOOP
 // ═══════════════════════════════════════════════════════════════════
 
 async fn sse_listener_loop(
@@ -211,11 +245,13 @@ async fn sse_listener_loop(
     session_endpoint: Arc<Mutex<Option<String>>>,
     pending: Arc<Mutex<HashMap<i64, oneshot::Sender<serde_json::Value>>>>,
     next_id: Arc<AtomicI64>,
+    available_tools: Arc<Mutex<Vec<ToolInfo>>>,
     mut shutdown_rx: oneshot::Receiver<()>,
 ) {
     let mut stream = response.bytes_stream();
     let mut buf = String::new();
     let mut endpoint_received = false;
+    let mut initialized = false;
 
     let _ = event_tx.send(McpClientEvent::Debug(
         "📥 SSE listener loop started".to_string()
@@ -262,11 +298,7 @@ async fn sse_listener_loop(
                                 continue;
                             }
 
-                            let _ = event_tx.send(McpClientEvent::Debug(
-                                format!("📨 SSE event='{}' data='{}'", event_type, data)
-                            )).await;
-
-                            // Obsługa endpointu (tylko raz)
+                            // Obsługa endpointu
                             if event_type == "endpoint" && !endpoint_received {
                                 {
                                     let mut lock = session_endpoint.lock().await;
@@ -292,7 +324,34 @@ async fn sse_listener_loop(
 
                             // Parsowanie JSON-RPC
                             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
-                                handle_json_rpc_event(v, &event_tx, &pending).await;
+                                // Sprawdź czy to odpowiedź na initialize
+                                if !initialized {
+                                    if let Some(id) = v.get("id").and_then(|i| i.as_i64()) {
+                                        if id == 1 && v.get("result").is_some() {
+                                            initialized = true;
+                                            let _ = event_tx.send(McpClientEvent::Message(
+                                                "✅ MCP session initialized".to_string()
+                                            )).await;
+
+                                            // Automatycznie pobierz listę narzędzi
+                                            auto_load_tools(
+                                                &client,
+                                                &base_url,
+                                                &session_endpoint,
+                                                &next_id,
+                                                &event_tx,
+                                            ).await;
+                                            continue;
+                                        }
+                                    }
+                                }
+
+                                handle_json_rpc_event(
+                                    v,
+                                    &event_tx,
+                                    &pending,
+                                    &available_tools,
+                                ).await;
                             } else {
                                 let _ = event_tx.send(
                                     McpClientEvent::Message(data.clone())
@@ -323,6 +382,48 @@ async fn sse_listener_loop(
     let _ = event_tx.send(McpClientEvent::Debug(
         "🔚 SSE listener loop terminated".to_string()
     )).await;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// AUTO-LOAD TOOLS
+// ═══════════════════════════════════════════════════════════════════
+
+async fn auto_load_tools(
+    client: &Client,
+    base_url: &str,
+    session_endpoint: &Arc<Mutex<Option<String>>>,
+    next_id: &Arc<AtomicI64>,
+    event_tx: &mpsc::Sender<McpClientEvent>,
+) {
+    sleep(Duration::from_millis(100)).await;
+
+    let ep = {
+        let lock = session_endpoint.lock().await;
+        lock.clone()
+    };
+
+    if let Some(endpoint) = ep {
+        let id = next_id.fetch_add(1, Ordering::SeqCst);
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/list",
+            "params": {}
+        });
+
+        let full_url = join_url(base_url, &endpoint);
+
+        let _ = event_tx.send(McpClientEvent::Debug(
+            "🔄 Auto loading tools...".to_string()
+        )).await;
+
+        // let _ = client
+        //     .post(&full_url)
+        //     .header("Content-Type", "application/json")
+        //     .body(req.to_string())
+        //     .send()
+        //     .await;
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -359,30 +460,11 @@ async fn send_initialize(
         format!("📤 Sending initialize to: {}", full_url)
     )).await;
 
-    match client.post(&full_url)
+    let _ = client.post(&full_url)
         .header("Content-Type", "application/json")
         .body(init.to_string())
         .send()
-        .await
-    {
-        Ok(resp) => {
-            let status = resp.status();
-            let _ = event_tx.send(McpClientEvent::Debug(
-                format!("📥 Initialize response: HTTP {}", status)
-            )).await;
-
-            if status.is_success() || status.as_u16() == 202 {
-                let _ = event_tx.send(McpClientEvent::Debug(
-                    "✅ Initialize accepted, awaiting SSE response".to_string()
-                )).await;
-            }
-        }
-        Err(e) => {
-            let _ = event_tx.send(McpClientEvent::Error(
-                format!("Initialize request failed: {}", e)
-            )).await;
-        }
-    }
+        .await;
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -393,6 +475,7 @@ async fn handle_json_rpc_event(
     v: serde_json::Value,
     event_tx: &mpsc::Sender<McpClientEvent>,
     pending: &Arc<Mutex<HashMap<i64, oneshot::Sender<serde_json::Value>>>>,
+    available_tools: &Arc<Mutex<Vec<ToolInfo>>>,
 ) {
     // Obsługa odpowiedzi (z id)
     if let Some(id) = v.get("id").and_then(|v| v.as_i64()) {
@@ -404,18 +487,43 @@ async fn handle_json_rpc_event(
                 // Specjalna obsługa tools/list
                 if let Some(tools) = result.get("tools") {
                     if let Some(tools_array) = tools.as_array() {
-                        let tool_names: Vec<String> = tools_array
+                        let tool_infos: Vec<ToolInfo> = tools_array
                             .iter()
-                            .filter_map(|t| t.get("name")?.as_str())
-                            .map(|s| s.to_string())
+                            .filter_map(|t| {
+                                Some(ToolInfo {
+                                    name: t.get("name")?.as_str()?.to_string(),
+                                    description: t.get("description")?.as_str()?.to_string(),
+                                    input_schema: t.get("inputSchema")?.clone(),
+                                })
+                            })
                             .collect();
 
-                        if !tool_names.is_empty() {
+                        if !tool_infos.is_empty() {
+                            // Zapisz narzędzia w pamięci
+                            {
+                                let mut tools_lock = available_tools.lock().await;
+                                *tools_lock = tool_infos.clone();
+                            }
+
                             let _ = event_tx.send(
-                                McpClientEvent::ToolsListed(tool_names)
+                                McpClientEvent::ToolsListed(tool_infos)
                             ).await;
                             return;
                         }
+                    }
+                }
+
+                // Obsługa tools/call result
+                if let Some(content) = result.get("content") {
+                    if let Some(content_array) = content.as_array() {
+                        for item in content_array {
+                            if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                                let _ = event_tx.send(McpClientEvent::Message(
+                                    format!("📋 Tool result:\n{}", text)
+                                )).await;
+                            }
+                        }
+                        return;
                     }
                 }
 

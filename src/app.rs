@@ -1,7 +1,7 @@
 use crate::command::Command;
 use crate::config::Config;
 use crate::event::Event;
-use crate::mcp::{McpClient, McpClientEvent};
+use crate::mcp::{McpClient, McpClientEvent, ToolInfo};
 use crate::mode::Mode;
 use crate::state::{Buffer, OutputLog};
 use anyhow::Result;
@@ -21,12 +21,20 @@ pub struct App {
     pub mcp_event_rx: mpsc::Receiver<McpClientEvent>,
     config: Config,
     server_selection: Option<ServerSelection>,
+    tool_selection: Option<ToolSelection>,
     mouse_enabled: bool,
+    available_tools: Vec<ToolInfo>,
 }
 
 #[derive(Debug)]
 pub struct ServerSelection {
     servers: Vec<String>,
+    selected: usize,
+}
+
+#[derive(Debug)]
+pub struct ToolSelection {
+    tools: Vec<ToolInfo>,
     selected: usize,
 }
 
@@ -47,7 +55,9 @@ impl App {
             mcp_event_rx,
             config,
             server_selection: None,
+            tool_selection: None,
             mouse_enabled: true,
+            available_tools: Vec::new(),
         }
     }
 
@@ -91,6 +101,10 @@ impl App {
         self.server_selection.as_ref()
     }
 
+    pub fn tool_selection(&self) -> Option<&ToolSelection> {
+        self.tool_selection.as_ref()
+    }
+
     pub const fn mouse_enabled(&self) -> bool {
         self.mouse_enabled
     }
@@ -128,10 +142,21 @@ impl App {
                 self.output = self.output.with_message(format!("❌ [MCP Error] {}", err));
             }
             McpClientEvent::ToolsListed(tools) => {
+                self.available_tools = tools.clone();
                 self.output = self.output.with_message("📦 Available tools:".to_string());
-                for tool in tools {
-                    self.output = self.output.with_message(format!("  • {}", tool));
+                for tool in &tools {
+                    let desc_preview = if tool.description.len() > 80 {
+                        format!("{}...", &tool.description[..77])
+                    } else {
+                        tool.description.clone()
+                    };
+                    self.output = self.output.with_message(
+                        format!("  • {}: {}", tool.name, desc_preview)
+                    );
                 }
+                self.output = self.output.with_message(
+                    format!("Total: {} tools available", tools.len())
+                );
             }
             McpClientEvent::Debug(msg) => {
                 self.output = self.output.with_message(format!("🔍 {}", msg));
@@ -140,8 +165,13 @@ impl App {
         Ok(self)
     }
 
-    async fn handle_key(mut self, code: KeyCode, mods: KeyModifiers) -> Result<Self> {
-        // Server selection mode has priority
+    async fn handle_key(self, code: KeyCode, mods: KeyModifiers) -> Result<Self> {
+        // Tool selection mode has highest priority
+        if self.tool_selection.is_some() {
+            return self.handle_tool_selection_key(code).await;
+        }
+
+        // Server selection mode has second priority
         if self.server_selection.is_some() {
             return self.handle_server_selection_key(code).await;
         }
@@ -157,7 +187,61 @@ impl App {
         }
     }
 
-    // ═══════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════
+    // Tool selection mode
+    // ═══════════════════════════════════════════════════════════════════
+
+    async fn handle_tool_selection_key(mut self, code: KeyCode) -> Result<Self> {
+        let (selected, tools) = match &mut self.tool_selection {
+            Some(s) => (s.selected, s.tools.clone()),
+            None => return Ok(self),
+        };
+
+        match code {
+            KeyCode::Esc => {
+                self.tool_selection = None;
+                self.status = "Tool selection cancelled".into();
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(selection) = &mut self.tool_selection {
+                    if selection.selected > 0 {
+                        selection.selected -= 1;
+                    }
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(selection) = &mut self.tool_selection {
+                    if selection.selected < selection.tools.len() - 1 {
+                        selection.selected += 1;
+                    }
+                }
+            }
+            KeyCode::Enter => {
+                let tool = tools[selected].clone();
+                self.tool_selection = None;
+
+                self.status = format!("Calling tool '{}'...", tool.name);
+                
+                // For now, call with empty arguments
+                self.mcp_client.call_tool(tool.name.clone(), serde_json::json!({})).await;
+            }
+            KeyCode::Char(c) if c.is_ascii_digit() => {
+                let idx = c.to_digit(10).unwrap() as usize;
+                if idx > 0 && idx <= tools.len() {
+                    let tool = tools[idx - 1].clone();
+                    self.tool_selection = None;
+
+                    self.status = format!("Calling tool '{}'...", tool.name);
+                    self.mcp_client.call_tool(tool.name.clone(), serde_json::json!({})).await;
+                }
+            }
+            _ => {}
+        }
+
+        Ok(self)
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
     // Server selection mode
     // ═══════════════════════════════════════════════════════════════
 
@@ -361,8 +445,9 @@ impl App {
                     .with_message("  :echo <text>             - Echo text to output".to_string())
                     .with_message("  :mouse on/off            - Enable/disable mouse capture".to_string())
                     .with_message("  :mcp list                - List configured MCP servers".to_string())
-                    .with_message("  :mcp tools               - List tools of connected MCP server".to_string())
+                    .with_message("  :mcp tools               - List tools from connected server".to_string())
                     .with_message("  :mcp cn, :mcp connect    - Connect to MCP server (interactive)".to_string())
+                    .with_message("  :mcp run [tool_name]     - Run MCP tool (interactive or direct)".to_string())
                     .with_message("  :h, :help                - Show this help".to_string());
                 self.status = "Help displayed".into();
             }
@@ -414,8 +499,64 @@ impl App {
                 }
             }
             Ok(Command::McpTools) => {
-                self.status = "Listing tools...".to_string();
-                self.mcp_client.list_tools().await;
+                if self.available_tools.is_empty() {
+                    self.output = self.output.with_message(
+                        "⚠️ No tools available. Connect to a server first with :mcp connect".to_string()
+                    );
+                } else {
+                    self.output = self.output.with_message("📦 Available tools:".to_string());
+                    for (i, tool) in self.available_tools.iter().enumerate() {
+                        let desc_preview = if tool.description.len() > 80 {
+                            format!("{}...", &tool.description[..77])
+                        } else {
+                            tool.description.clone()
+                        };
+                        self.output = self.output.with_message(
+                            format!("  [{}] {}: {}", i + 1, tool.name, desc_preview)
+                        );
+                    }
+                    self.output = self.output.with_message(
+                        format!("Total: {} tools - use :mcp run to execute", self.available_tools.len())
+                    );
+                }
+            }
+            Ok(Command::McpRun(tool_name)) => {
+                if self.available_tools.is_empty() {
+                    self.output = self.output.with_message(
+                        "⚠️ No tools available. Connect to a server first with :mcp connect".to_string()
+                    );
+                } else if let Some(name) = tool_name {
+                    // Direct tool call by name
+                    if let Some(tool) = self.available_tools.iter().find(|t| t.name == name) {
+                        self.status = format!("Calling tool '{}'...", tool.name);
+                        self.mcp_client.call_tool(tool.name.clone(), serde_json::json!({})).await;
+                    } else {
+                        self.status = format!("Tool '{}' not found", name);
+                    }
+                } else {
+                    // Interactive tool selection
+                    self.output = self.output.with_message("🔧 Select tool to run:".to_string());
+                    for (i, tool) in self.available_tools.iter().enumerate() {
+                        let prefix = if i == 0 { "→" } else { " " };
+                        let desc_preview = if tool.description.len() > 60 {
+                            format!("{}...", &tool.description[..57])
+                        } else {
+                            tool.description.clone()
+                        };
+                        self.output = self.output.with_message(
+                            format!("  {} [{}] {}: {}", prefix, i + 1, tool.name, desc_preview)
+                        );
+                    }
+                    self.output = self.output
+                        .with_message("".to_string())
+                        .with_message("Use ↑↓ or j/k to navigate, Enter to run, Esc to cancel".to_string());
+
+                    self.tool_selection = Some(ToolSelection {
+                        tools: self.available_tools.clone(),
+                        selected: 0,
+                    });
+                    self.status = "Select tool with ↑↓ or number keys".into();
+                }
             }
             Ok(Command::Mouse(enabled)) => {
                 self.mouse_enabled = enabled;
@@ -450,6 +591,16 @@ impl Default for App {
 impl ServerSelection {
     pub fn servers(&self) -> &[String] {
         &self.servers
+    }
+
+    pub fn selected(&self) -> usize {
+        self.selected
+    }
+}
+
+impl ToolSelection {
+    pub fn tools(&self) -> &[ToolInfo] {
+        &self.tools
     }
 
     pub fn selected(&self) -> usize {

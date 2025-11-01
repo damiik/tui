@@ -19,7 +19,6 @@ impl UI {
     }
 
     /// Pure function: Frame × App → ()
-    /// Renders application state to terminal frame
     pub fn render(&self, frame: &mut Frame, app: &App) {
         let layout = Self::create_layout(frame.area());
 
@@ -105,8 +104,10 @@ impl UI {
     fn render_status_bar(&self, frame: &mut Frame, app: &App, area: Rect) {
         let mode = app.mode();
 
-        // If in server selection mode, show different indicator
-        let (mode_text, mode_color) = if app.server_selection().is_some() {
+        // Determine mode indicator based on selection state
+        let (mode_text, mode_color) = if app.tool_selection().is_some() {
+            ("TOOL", Color::Yellow)
+        } else if app.server_selection().is_some() {
             ("SELECT", Color::Magenta)
         } else {
             (mode.name(), mode.color())
@@ -125,7 +126,12 @@ impl UI {
             Style::default().fg(Color::White),
         );
 
-        let help_text = if app.server_selection().is_some() {
+        let help_text = if app.tool_selection().is_some() {
+            Span::styled(
+                " ↑↓:Navigate | Enter:Run | Esc:Cancel ",
+                Style::default().fg(Color::DarkGray),
+            )
+        } else if app.server_selection().is_some() {
             Span::styled(
                 " ↑↓:Navigate | Enter:Select | Esc:Cancel ",
                 Style::default().fg(Color::DarkGray),
@@ -150,8 +156,8 @@ impl UI {
     // ═══════════════════════════════════════════════════════════════
 
     fn render_input_line(&self, frame: &mut Frame, app: &App, area: Rect) {
-        // If in server selection mode, show nothing or selection info
-        if app.server_selection().is_some() {
+        // If in selection mode, hide input
+        if app.server_selection().is_some() || app.tool_selection().is_some() {
             let paragraph = Paragraph::new("")
                 .style(Style::default().bg(Color::Black));
             frame.render_widget(paragraph, area);
