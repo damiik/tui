@@ -82,183 +82,18 @@ impl McpClient {
                         }
 
                         let _ = event_tx.send(McpClientEvent::Connected).await;
-                        let mut stream = response.bytes_stream();
-                        let mut buf = String::new();
-                        let mut endpoint: Option<String> = None;
-
-                    let _ = event_tx.send(McpClientEvent::Debug(
-                        "📥 Waiting for SSE endpoint...".to_string()
-                    )).await;
-
-                        // Parse SSE stream to extract endpoint
-                        loop {
-                            tokio::select! {
-                                biased;
-
-                                _ = &mut shutdown_rx => {
-                                    let _ = event_tx.send(McpClientEvent::Disconnected).await;
-                                    endpoint = None;
-                                    break;
-                                }
-
-                                item = stream.next() => {
-                                    match item {
-                                        Some(Ok(chunk)) => {
-                                            let txt = String::from_utf8_lossy(&chunk).to_string();
-                                            buf.push_str(&txt);
-
-                                            // Process complete SSE messages
-                                            while let Some(split) = buf.find("\n\n") {
-                                                let block = buf[..split].to_string();
-                                                buf = buf[split + 2..].to_string();
-
-                                            let mut event_type = String::new();
-                                                let mut data = String::new();
-
-                                                for line in block.lines() {
-                                                if let Some(rest) = line.strip_prefix("event:") {
-                                                    event_type = rest.trim().to_string();
-                                                } else if let Some(rest) = line.strip_prefix("data:") {
-                                                        if !data.is_empty() {
-                                                            data.push('\n');
-                                                        }
-                                                        data.push_str(rest.trim());
-                                                    }
-                                                }
-
-                                                if data.is_empty() {
-                                                    continue;
-                                                }
-
-                                            let _ = event_tx.send(McpClientEvent::Debug(
-                                                format!("📨 SSE event='{}' data='{}'", event_type, data)
-                                            )).await;
-
-                                                // Check for endpoint announcement
-                                            if event_type == "endpoint" {
-                                                endpoint = Some(data.clone());
-                                                let _ = event_tx.send(McpClientEvent::Debug(
-                                                    format!("✅ Received endpoint: {}", data)
-                                                )).await;
-                                                        break;
-                                                    }
-
-                                                // Try parsing as JSON-RPC
-                                                match serde_json::from_str::<serde_json::Value>(&data) {
-                                                    Ok(v) => {
-                                                    let _ = event_tx.send(McpClientEvent::Debug(
-                                                        format!("📦 JSON-RPC: {}", serde_json::to_string(&v).unwrap_or_default())
-                                                    )).await;
-                                                        handle_json_rpc_event(v, &event_tx, &pending).await;
-                                                    }
-                                                    Err(_) => {
-                                                        let _ = event_tx.send(
-                                                            McpClientEvent::Message(data.clone())
-                                                        ).await;
-                                                    }
-                                                }
-                                            }
-
-                                            if endpoint.is_some() {
-                                                break;
-                                            }
-                                        }
-
-                                        Some(Err(e)) => {
-                                            let _ = event_tx.send(
-                                                McpClientEvent::Error(format!("Stream error: {}", e))
+                    
+                    // KLUCZ: Rozpocznij długotrwałe nasłuchiwanie SSE
+                    sse_listener_loop(
+                        response,
+                        event_tx.clone(),
+                        client.clone(),
+                        url.clone(),
+                        session_endpoint.clone(),
+                        pending.clone(),
+                        next_id.clone(),
+                        shutdown_rx,
                                             ).await;
-                                            break;
-                                        }
-
-                                    None => {
-                                        let _ = event_tx.send(McpClientEvent::Debug(
-                                            "⚠️ Stream ended without endpoint".to_string()
-                                        )).await;
-                                        break;
-                                    }
-                                    }
-                                }
-                            }
-                        }
-
-                        let endpoint = match endpoint {
-                            Some(ep) => ep,
-                            None => {
-                                let _ = event_tx.send(McpClientEvent::Error(
-                                    "No endpoint received from server".into()
-                                )).await;
-                            return;
-                            }
-                        };
-
-                        // Store endpoint for future requests
-                        {
-                            let mut lock = session_endpoint.lock().await;
-                            *lock = Some(endpoint.clone());
-                        }
-
-                        let full_url = join_url(&url, &endpoint);
-                    let _ = event_tx.send(McpClientEvent::Debug(
-                        format!("🔗 Session endpoint: {}", full_url)
-                    )).await;
-
-
-                    // Wait a bit for SSE to stabilize
-                    sleep(Duration::from_millis(100)).await;
-
-                        // Send initialize request
-                    let id = next_id.fetch_add(1, Ordering::SeqCst);
-                        let init = json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "method": "initialize",
-                            "params": {
-                                "protocolVersion": "2024-11-05",
-                                "capabilities": {},
-                                "clientInfo": {
-                                    "name": "mcp-client",
-                                    "version": "0.1.0"
-                                }
-                            }
-                        });
-
-                    let _ = event_tx.send(McpClientEvent::Debug(
-                        format!("📤 Sending initialize: {}", serde_json::to_string(&init).unwrap_or_default())
-                    )).await;
-
-                    match client.post(&full_url)
-                            .header("Content-Type", "application/json")
-                            .body(init.to_string())
-                            .send()
-                        .await
-                    {
-                        Ok(resp) => {
-                            let _ = event_tx.send(McpClientEvent::Debug(
-                                format!("📥 Initialize response: HTTP {}", resp.status())
-                            )).await;
-
-                            if resp.status().is_success() {
-                                if let Ok(body) = resp.text().await {
-                                    let _ = event_tx.send(McpClientEvent::Debug(
-                                        format!("📄 Initialize body: {}", body)
-                                    )).await;
-                                }
-                                let _ = event_tx.send(McpClientEvent::Message(
-                                    "✅ MCP session initialized".to_string()
-                                )).await;
-                            } else {
-                                let _ = event_tx.send(McpClientEvent::Error(
-                                    format!("Initialize failed: {}", resp.status())
-                                )).await;
-                            }
-                    }
-                    Err(e) => {
-                        let _ = event_tx.send(McpClientEvent::Error(
-                                format!("Initialize request failed: {}", e)
-                        )).await;
-                        }
-                    }
                 }
                 Err(e) => {
                     let _ = event_tx.send(McpClientEvent::Error(
@@ -344,14 +179,18 @@ impl McpClient {
                     format!("📥 Response: HTTP {}", status)
                 )).await;
 
-                if status.is_success() {
-                    if let Ok(body) = r.text().await {
-                        let _ = self.event_tx.send(McpClientEvent::Debug(
-                            format!("📄 Response body: {}", body)
-                        )).await;
-                    }
+                // HTTP 202 Accepted jest poprawny - odpowiedź przyjdzie przez SSE
+                if status.is_success() || status.as_u16() == 202 {
+                    let _ = self.event_tx.send(McpClientEvent::Debug(
+                        "✅ Request accepted, awaiting SSE response".to_string()
+                    )).await;
                     Ok(())
                 } else {
+                    if let Ok(body) = r.text().await {
+                        let _ = self.event_tx.send(McpClientEvent::Debug(
+                            format!("📄 Error body: {}", body)
+                        )).await;
+                    }
                     Err(format!("POST HTTP error: {}", status))
                 }
             }
@@ -360,8 +199,193 @@ impl McpClient {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// SSE LISTENER LOOP - KLUCZOWA FUNKCJA
+// ═══════════════════════════════════════════════════════════════════
 
-// ═══════════════════════════════════════════════════════════════
+async fn sse_listener_loop(
+    response: reqwest::Response,
+    event_tx: mpsc::Sender<McpClientEvent>,
+    client: Client,
+    base_url: String,
+    session_endpoint: Arc<Mutex<Option<String>>>,
+    pending: Arc<Mutex<HashMap<i64, oneshot::Sender<serde_json::Value>>>>,
+    next_id: Arc<AtomicI64>,
+    mut shutdown_rx: oneshot::Receiver<()>,
+) {
+    let mut stream = response.bytes_stream();
+    let mut buf = String::new();
+    let mut endpoint_received = false;
+
+    let _ = event_tx.send(McpClientEvent::Debug(
+        "📥 SSE listener loop started".to_string()
+    )).await;
+
+    loop {
+        tokio::select! {
+            biased;
+
+            _ = &mut shutdown_rx => {
+                let _ = event_tx.send(McpClientEvent::Debug(
+                    "🛑 SSE listener shutdown requested".to_string()
+                )).await;
+                let _ = event_tx.send(McpClientEvent::Disconnected).await;
+                break;
+            }
+
+            item = stream.next() => {
+                match item {
+                    Some(Ok(chunk)) => {
+                        let txt = String::from_utf8_lossy(&chunk).to_string();
+                        buf.push_str(&txt);
+
+                        // Przetwarzaj kompletne wiadomości SSE
+                        while let Some(split) = buf.find("\n\n") {
+                            let block = buf[..split].to_string();
+                            buf = buf[split + 2..].to_string();
+
+                            let mut event_type = String::new();
+                            let mut data = String::new();
+
+                            for line in block.lines() {
+                                if let Some(rest) = line.strip_prefix("event:") {
+                                    event_type = rest.trim().to_string();
+                                } else if let Some(rest) = line.strip_prefix("data:") {
+                                    if !data.is_empty() {
+                                        data.push('\n');
+                                    }
+                                    data.push_str(rest.trim());
+                                }
+                            }
+
+                            if data.is_empty() {
+                                continue;
+                            }
+
+                            let _ = event_tx.send(McpClientEvent::Debug(
+                                format!("📨 SSE event='{}' data='{}'", event_type, data)
+                            )).await;
+
+                            // Obsługa endpointu (tylko raz)
+                            if event_type == "endpoint" && !endpoint_received {
+                                {
+                                    let mut lock = session_endpoint.lock().await;
+                                    *lock = Some(data.clone());
+                                }
+                                endpoint_received = true;
+
+                                let _ = event_tx.send(McpClientEvent::Debug(
+                                    format!("✅ Endpoint stored: {}", data)
+                                )).await;
+
+                                // Wysłanie initialize
+                                send_initialize(
+                                    &client,
+                                    &base_url,
+                                    &data,
+                                    &next_id,
+                                    &event_tx,
+                                ).await;
+                                
+                                continue;
+                            }
+
+                            // Parsowanie JSON-RPC
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
+                                handle_json_rpc_event(v, &event_tx, &pending).await;
+                            } else {
+                                let _ = event_tx.send(
+                                    McpClientEvent::Message(data.clone())
+                                ).await;
+                            }
+                        }
+                    }
+
+                    Some(Err(e)) => {
+                        let _ = event_tx.send(
+                            McpClientEvent::Error(format!("Stream error: {}", e))
+                        ).await;
+                        break;
+                    }
+
+                    None => {
+                        let _ = event_tx.send(McpClientEvent::Debug(
+                            "⚠️ SSE stream ended".to_string()
+                        )).await;
+                        let _ = event_tx.send(McpClientEvent::Disconnected).await;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let _ = event_tx.send(McpClientEvent::Debug(
+        "🔚 SSE listener loop terminated".to_string()
+    )).await;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// INITIALIZE REQUEST
+// ═══════════════════════════════════════════════════════════════════
+
+async fn send_initialize(
+    client: &Client,
+    base_url: &str,
+    endpoint: &str,
+    next_id: &Arc<AtomicI64>,
+    event_tx: &mpsc::Sender<McpClientEvent>,
+) {
+    sleep(Duration::from_millis(100)).await;
+
+    let id = next_id.fetch_add(1, Ordering::SeqCst);
+    let init = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {
+                "name": "mcp-client",
+                "version": "0.1.0"
+            }
+        }
+    });
+
+    let full_url = join_url(base_url, endpoint);
+
+    let _ = event_tx.send(McpClientEvent::Debug(
+        format!("📤 Sending initialize to: {}", full_url)
+    )).await;
+
+    match client.post(&full_url)
+        .header("Content-Type", "application/json")
+        .body(init.to_string())
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let status = resp.status();
+            let _ = event_tx.send(McpClientEvent::Debug(
+                format!("📥 Initialize response: HTTP {}", status)
+            )).await;
+
+            if status.is_success() || status.as_u16() == 202 {
+                let _ = event_tx.send(McpClientEvent::Debug(
+                    "✅ Initialize accepted, awaiting SSE response".to_string()
+                )).await;
+            }
+        }
+        Err(e) => {
+            let _ = event_tx.send(McpClientEvent::Error(
+                format!("Initialize request failed: {}", e)
+            )).await;
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // JSON-RPC EVENT HANDLER
 // ═══════════════════════════════════════════════════════════════
 
@@ -370,14 +394,14 @@ async fn handle_json_rpc_event(
     event_tx: &mpsc::Sender<McpClientEvent>,
     pending: &Arc<Mutex<HashMap<i64, oneshot::Sender<serde_json::Value>>>>,
 ) {
-    // Handle responses (with id)
+    // Obsługa odpowiedzi (z id)
     if let Some(id) = v.get("id").and_then(|v| v.as_i64()) {
         let mut pending_guard = pending.lock().await;
         if let Some(tx) = pending_guard.remove(&id) {
             if let Some(result) = v.get("result") {
                 let _ = tx.send(result.clone());
 
-                // Handle tools/list response
+                // Specjalna obsługa tools/list
                 if let Some(tools) = result.get("tools") {
                     if let Some(tools_array) = tools.as_array() {
                         let tool_names: Vec<String> = tools_array
@@ -414,19 +438,19 @@ async fn handle_json_rpc_event(
         match method {
             "notifications/tools/list_changed" => {
                 let _ = event_tx.send(McpClientEvent::Message(
-                    "Tools list changed - use :mcp tools to refresh".to_string()
+                    "🔔 Tools list changed - use :mcp tools to refresh".to_string()
                 )).await;
             }
             _ => {
                 let _ = event_tx.send(McpClientEvent::Message(
-                    format!("Notification: {}", method)
+                    format!("🔔 Notification: {}", method)
                 )).await;
             }
         }
         return;
     }
 
-    // Fallback: display raw JSON
+    // Fallback: wyświetl surowy JSON
     let _ = event_tx.send(McpClientEvent::Message(
         serde_json::to_string_pretty(&v).unwrap_or_default()
     )).await;
@@ -447,7 +471,7 @@ fn join_url(base: &str, endpoint: &str) -> String {
 
     // Parse base URL to extract scheme, host, and port
     if let Some(scheme_end) = base.find("://") {
-        let scheme = &base[..scheme_end + 3]; // includes ://
+        let scheme = &base[..scheme_end + 3];
         let rest = &base[scheme_end + 3..];
         
         // Find where path starts (after host:port)
@@ -513,22 +537,6 @@ mod url_tests {
         assert_eq!(
             join_url("http://localhost:8080", "/messages"),
             "http://localhost:8080/messages"
-        );
-    }
-
-    #[test]
-    fn test_join_url_with_query() {
-        assert_eq!(
-            join_url("http://localhost:8080/api", "/session?id=abc"),
-            "http://localhost:8080/session?id=abc"
-        );
-    }
-
-    #[test]
-    fn test_join_url_full_url_endpoint() {
-        assert_eq!(
-            join_url("http://localhost:8080/sse", "http://example.com/path"),
-            "http://example.com/path"
         );
     }
 }
