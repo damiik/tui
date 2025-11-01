@@ -26,6 +26,7 @@ pub struct App {
     available_tools: Vec<ToolInfo>,
     scroll_offset: u16,
     autoscroll: bool,
+    output_height: u16,
 }
 
 #[derive(Debug)]
@@ -62,40 +63,72 @@ impl App {
             available_tools: Vec::new(),
             scroll_offset: 0,
             autoscroll: true,
+            output_height: 0, // Will be updated by the UI loop
         }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // State modifiers
+    // ═══════════════════════════════════════════════════════════════
+
+    pub fn set_output_height(&mut self, height: u16) {
+        self.output_height = height;
+        // Recalculate scroll on resize
+        self.scroll_to_bottom();
     }
 
     // ═══════════════════════════════════════════════════════════════
     // Scrolling methods
     // ═══════════════════════════════════════════════════════════════
 
+    fn view_height(&self) -> u16 {
+        self.output_height.saturating_sub(2) // Account for paragraph borders
+    }
+
+    fn max_scroll_offset(&self) -> u16 {
+        let content_len = self.output.lines().len() as u16;
+        let view_height = self.view_height();
+        content_len.saturating_sub(view_height)
+    }
+
     fn enable_autoscroll(&mut self) {
         self.autoscroll = true;
-        self.scroll_to_bottom();
     }
 
     fn disable_autoscroll(&mut self) {
         self.autoscroll = false;
     }
 
+    /// Scrolls to the bottom of the output buffer if autoscroll is enabled.
+    /// This is the primary method for auto-scrolling.
     fn scroll_to_bottom(&mut self) {
         if self.autoscroll {
-            let max_offset = self.output.lines().len().saturating_sub(1) as u16;
-            self.scroll_offset = max_offset;
+            self.scroll_offset = self.max_scroll_offset();
         }
     }
 
+    /// Scrolls up one line, disabling autoscroll.
     fn scroll_up(&mut self) {
         self.disable_autoscroll();
         self.scroll_offset = self.scroll_offset.saturating_sub(1);
     }
 
+    /// Scrolls down one line. If the bottom is reached, re-enables autoscroll.
     fn scroll_down(&mut self) {
-        self.disable_autoscroll();
-        let max_offset = self.output.lines().len().saturating_sub(1) as u16;
+        self.disable_autoscroll(); // Assume manual scroll until we check position
+        let max_offset = self.max_scroll_offset();
         if self.scroll_offset < max_offset {
             self.scroll_offset += 1;
         }
+        if self.scroll_offset >= max_offset {
+            self.enable_autoscroll();
+        }
+    }
+
+    /// Jumps to the bottom and re-enables autoscroll.
+    fn jump_to_bottom(&mut self) {
+        self.enable_autoscroll();
+        self.scroll_to_bottom();
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -378,7 +411,7 @@ impl App {
                 self.scroll_down();
             }
             KeyCode::End => {
-                self.enable_autoscroll();
+                self.jump_to_bottom();
             }
             _ => {}
         }
@@ -500,9 +533,14 @@ impl App {
                 self.status = "Output cleared".into();
             }
             Ok(Command::Echo(msg)) => {
-                self.output = self.output.with_message(msg.clone());
-                self.scroll_to_bottom();
-                self.status = format!("Echoed: {}", msg);
+                let msgc = msg.clone();
+                let msg_string = msgc.to_string();
+                let msgv = msg_string.split(' ').collect::<Vec<&str>>();
+                for m in msgv.clone() {
+                    self.output = self.output.with_message("dupa".to_string());//m.to_string());
+                    self.scroll_to_bottom();
+                }
+                self.status = format!("Echoed");// {}", &msgv.get(0).unwrap_or(&"")); // Show first line only
             }
             Ok(Command::Help) => {
                 self.output = self.output

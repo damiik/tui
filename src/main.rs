@@ -46,8 +46,17 @@ async fn run_loop(
     ui: &UI,
 ) -> Result<()> {
     let mut last_mouse_state = app.mouse_enabled();
+    let mut last_size = ratatui::layout::Size::default();
 
     loop {
+        // Update app state with current UI geometry
+        let size = terminal.size()?;
+        if size != last_size {
+            let output_height = size.height.saturating_sub(2); // Total height - status bar - input line
+            app.set_output_height(output_height);
+            last_size = size;
+        }
+
         terminal.draw(|frame| ui.render(frame, &app))?;
 
         // Handle mouse capture state changes

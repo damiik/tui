@@ -479,10 +479,14 @@ async fn handle_json_rpc_event(
 ) {
     // Obsługa odpowiedzi (z id)
     if let Some(id) = v.get("id").and_then(|v| v.as_i64()) {
-        let mut pending_guard = pending.lock().await;
-        if let Some(tx) = pending_guard.remove(&id) {
+
+
+        // let mut pending_guard = pending.lock().await;
+        // if let Some(tx) = pending_guard.remove(&id) {
+
+
             if let Some(result) = v.get("result") {
-                let _ = tx.send(result.clone());
+                // let _ = tx.send(result.clone());
 
                 // Specjalna obsługa tools/list
                 if let Some(tools) = result.get("tools") {
@@ -491,9 +495,9 @@ async fn handle_json_rpc_event(
                             .iter()
                             .filter_map(|t| {
                                 Some(ToolInfo {
-                                    name: t.get("name")?.as_str()?.to_string(),
                                     description: t.get("description")?.as_str()?.to_string(),
                                     input_schema: t.get("inputSchema")?.clone(),
+                                    name: t.get("name")?.as_str()?.to_string(),
                                 })
                             })
                             .collect();
@@ -542,7 +546,7 @@ async fn handle_json_rpc_event(
                 )).await;
             }
             return;
-        }
+       // }
     }
 
     // Handle notifications (no id)
@@ -563,9 +567,9 @@ async fn handle_json_rpc_event(
     }
 
     // Fallback: wyświetl surowy JSON
-    let _ = event_tx.send(McpClientEvent::Message(
-        serde_json::to_string_pretty(&v).unwrap_or_default()
-    )).await;
+    // let _ = event_tx.send(McpClientEvent::Message(
+    //     serde_json::to_string_pretty(&v).unwrap_or_default()
+    // )).await;
 }
 
 // ═══════════════════════════════════════════════════════════════
