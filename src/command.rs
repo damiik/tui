@@ -19,7 +19,8 @@ pub enum Command {
     McpConnect(Option<String>),
     McpList,
     McpTools,
-    McpRun(Option<String>), // None = interactive selection, Some(name) = direct call
+    McpRun(Option<String>),
+    McpStatus, // New: show connection status
     Mouse(bool),
 }
 
@@ -55,6 +56,7 @@ impl Command {
             ["mcp", "tools"] => Ok(Command::McpTools),
             ["mcp", "run"] => Ok(Command::McpRun(None)),
             ["mcp", "run", name] => Ok(Command::McpRun(Some(name.to_string()))),
+            ["mcp", "status"] => Ok(Command::McpStatus),
             ["mouse", "on"] => Ok(Command::Mouse(true)),
             ["mouse", "off"] => Ok(Command::Mouse(false)),
             [cmd, ..] => Err(CommandError::Unknown(cmd.to_string())),

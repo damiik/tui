@@ -76,7 +76,7 @@ impl McpClient {
         let next_id = self.next_id.clone();
         let available_tools = self.available_tools.clone();
 
-        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
         *sse_shutdown.lock().await = Some(shutdown_tx);
 
         tokio::spawn(async move {
@@ -417,12 +417,12 @@ async fn auto_load_tools(
             "🔄 Auto loading tools...".to_string()
         )).await;
 
-        // let _ = client
-        //     .post(&full_url)
-        //     .header("Content-Type", "application/json")
-        //     .body(req.to_string())
-        //     .send()
-        //     .await;
+        let _ = client
+            .post(&full_url)
+            .header("Content-Type", "application/json")
+            .body(req.to_string())
+            .send()
+            .await;
     }
 }
 
@@ -504,6 +504,10 @@ async fn handle_json_rpc_event(
                                 let mut tools_lock = available_tools.lock().await;
                                 *tools_lock = tool_infos.clone();
                             }
+
+                            let _ = event_tx.send(McpClientEvent::Debug(
+                                format!("✅ Stored {} tools in client memory", tool_infos.len())
+                            )).await;
 
                             let _ = event_tx.send(
                                 McpClientEvent::ToolsListed(tool_infos)

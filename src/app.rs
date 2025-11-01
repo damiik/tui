@@ -8,7 +8,7 @@ use anyhow::Result;
 use crossterm::event::{KeyCode, KeyModifiers};
 use tokio::sync::mpsc;
 
-/// Application state with server selection mode
+/// Application state with server and tool selection modes
 #[derive(Debug)]
 pub struct App {
     mode: Mode,
@@ -134,6 +134,8 @@ impl App {
             }
             McpClientEvent::Disconnected => {
                 self.status = "MCP client disconnected".into();
+                // Clear tools on disconnect
+                self.available_tools.clear();
             }
             McpClientEvent::Message(msg) => {
                 self.output = self.output.with_message(msg);
@@ -142,7 +144,12 @@ impl App {
                 self.output = self.output.with_message(format!("❌ [MCP Error] {}", err));
             }
             McpClientEvent::ToolsListed(tools) => {
+                // CRITICAL: Store tools in App state FIRST
                 self.available_tools = tools.clone();
+                
+                self.output = self.output.with_message(
+                    format!("✅ Stored {} tools in App state", self.available_tools.len())
+                );
                 self.output = self.output.with_message("📦 Available tools:".to_string());
                 for tool in &tools {
                     let desc_preview = if tool.description.len() > 80 {
@@ -155,8 +162,10 @@ impl App {
                     );
                 }
                 self.output = self.output.with_message(
-                    format!("Total: {} tools available", tools.len())
+                    format!("Total: {} tools available - use :mcp tools or :mcp run", tools.len())
                 );
+                
+                self.status = format!("Loaded {} tools", tools.len());
             }
             McpClientEvent::Debug(msg) => {
                 self.output = self.output.with_message(format!("🔍 {}", msg));
@@ -444,10 +453,14 @@ impl App {
                     .with_message("  :clear                   - Clear output".to_string())
                     .with_message("  :echo <text>             - Echo text to output".to_string())
                     .with_message("  :mouse on/off            - Enable/disable mouse capture".to_string())
+                    .with_message("".to_string())
+                    .with_message("  MCP Commands:".to_string())
                     .with_message("  :mcp list                - List configured MCP servers".to_string())
-                    .with_message("  :mcp tools               - List tools from connected server".to_string())
                     .with_message("  :mcp cn, :mcp connect    - Connect to MCP server (interactive)".to_string())
+                    .with_message("  :mcp status              - Show connection and tools status".to_string())
+                    .with_message("  :mcp tools               - List tools from connected server".to_string())
                     .with_message("  :mcp run [tool_name]     - Run MCP tool (interactive or direct)".to_string())
+                    .with_message("".to_string())
                     .with_message("  :h, :help                - Show this help".to_string());
                 self.status = "Help displayed".into();
             }
@@ -503,6 +516,9 @@ impl App {
                     self.output = self.output.with_message(
                         "⚠️ No tools available. Connect to a server first with :mcp connect".to_string()
                     );
+                    self.output = self.output.with_message(
+                        format!("💡 Tip: Use :mcp status to check connection state")
+                    );
                 } else {
                     self.output = self.output.with_message("📦 Available tools:".to_string());
                     for (i, tool) in self.available_tools.iter().enumerate() {
@@ -519,6 +535,33 @@ impl App {
                         format!("Total: {} tools - use :mcp run to execute", self.available_tools.len())
                     );
                 }
+            }
+            Ok(Command::McpStatus) => {
+                self.output = self.output.with_message("📊 MCP Client Status:".to_string());
+                self.output = self.output.with_message(
+                    format!("  • Tools loaded: {}", self.available_tools.len())
+                );
+                if self.available_tools.is_empty() {
+                    self.output = self.output.with_message(
+                        "  • Status: Not connected or no tools available".to_string()
+                    );
+                    self.output = self.output.with_message(
+                        "  • Action: Use :mcp connect to establish connection".to_string()
+                    );
+                } else {
+                    self.output = self.output.with_message(
+                        "  • Status: Connected with tools loaded".to_string()
+                    );
+                    self.output = self.output.with_message(
+                        "  • Available tools:".to_string()
+                    );
+                    for tool in &self.available_tools {
+                        self.output = self.output.with_message(
+                            format!("    - {}", tool.name)
+                        );
+                    }
+                }
+                self.status = "Status displayed".into();
             }
             Ok(Command::McpRun(tool_name)) => {
                 if self.available_tools.is_empty() {
