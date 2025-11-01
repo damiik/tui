@@ -203,30 +203,6 @@ impl McpClient {
                         format!("🔗 Session endpoint: {}", full_url)
                     )).await;
 
-                        // Spawn SSE listener task
-                        let sse_client = client.clone();
-                        let sse_event_tx = event_tx.clone();
-                        let sse_session = session_endpoint.clone();
-                        let sse_pending = pending.clone();
-                        let full_url_clone = full_url.clone();
-                        let (sse_shutdown_tx, sse_shutdown_rx) = oneshot::channel();
-
-                        *sse_shutdown.lock().await = Some(sse_shutdown_tx);
-
-                        tokio::spawn(async move {
-                        let _ = sse_event_tx.send(McpClientEvent::Debug(
-                            format!("🎧 Starting SSE listener on {}", full_url_clone)
-                            )).await;
-
-                            sse_stream_loop(
-                                sse_client,
-                                full_url_clone,
-                                sse_event_tx.clone(),
-                                sse_session,
-                                sse_pending,
-                                sse_shutdown_rx,
-                            ).await;
-                        });
 
                     // Wait a bit for SSE to stabilize
                     sleep(Duration::from_millis(100)).await;
@@ -384,100 +360,6 @@ impl McpClient {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════
-// SSE LOOP
-// ═══════════════════════════════════════════════════════════════
-
-async fn sse_stream_loop(
-    client: Client,
-    url: String,
-    event_tx: mpsc::Sender<McpClientEvent>,
-    _session: Arc<Mutex<Option<String>>>,
-    pending: Arc<Mutex<HashMap<i64, oneshot::Sender<serde_json::Value>>>>,
-    mut shutdown_rx: oneshot::Receiver<()>,
-) {
-    let mut buf = String::new();
-    
-    loop {
-        match client.get(&url).send().await {
-            Ok(resp) => {
-                if !resp.status().is_success() {
-                    let _ = event_tx.send(McpClientEvent::Error(
-                        format!("SSE HTTP {}", resp.status())
-                    )).await;
-                    sleep(Duration::from_millis(500)).await;
-                    continue;
-                }
-
-                let mut stream = resp.bytes_stream();
-
-                loop {
-                    tokio::select! {
-                        _ = &mut shutdown_rx => {
-                            let _ = event_tx.send(McpClientEvent::Disconnected).await;
-                            return;
-                        }
-
-                        chunk = stream.next() => {
-                            match chunk {
-                                Some(Ok(bytes)) => {
-                                    let txt = String::from_utf8_lossy(&bytes).to_string();
-                                    buf.push_str(&txt);
-
-                                    while let Some(split) = buf.find("\n\n") {
-                                        let block = buf[..split].to_string();
-                                        buf = buf[split + 2..].to_string();
-
-                                        let mut data = String::new();
-                                        for line in block.lines() {
-                                            if let Some(r) = line.strip_prefix("data:") {
-                                                if !data.is_empty() {
-                                                    data.push('\n');
-                                                }
-                                                data.push_str(r.trim());
-                                            }
-                                        }
-
-                                        if data.is_empty() {
-                                            continue;
-                                        }
-
-                                        match serde_json::from_str::<serde_json::Value>(&data) {
-                                            Ok(v) => {
-                                                handle_json_rpc_event(v, &event_tx, &pending).await;
-                                            }
-                                            Err(_) => {
-                                                let _ = event_tx.send(
-                                                    McpClientEvent::Message(data.clone())
-                                                ).await;
-                                            }
-                                        }
-                                    }
-                                }
-
-                                Some(Err(e)) => {
-                                    let _ = event_tx.send(McpClientEvent::Error(
-                                        format!("SSE chunk error: {}", e)
-                                    )).await;
-                                    break;
-                                }
-
-                                None => break,
-                            }
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                let _ = event_tx.send(McpClientEvent::Error(
-                    format!("SSE connect error: {}", e)
-                )).await;
-                sleep(Duration::from_millis(500)).await;
-                continue;
-            }
-        }
-    }
-}
 
 // ═══════════════════════════════════════════════════════════════
 // JSON-RPC EVENT HANDLER
