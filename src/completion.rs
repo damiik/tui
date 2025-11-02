@@ -268,6 +268,7 @@ impl CompletionContext {
             "connect".to_string(),
             "cn".to_string(),
             "tools".to_string(),
+            "tool".to_string(),
             "run".to_string(),
             "status".to_string(),
         ]);

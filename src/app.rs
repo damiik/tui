@@ -9,6 +9,7 @@ use anyhow::Result;
 use crossterm::event::{KeyCode, KeyModifiers};
 use tokio::sync::mpsc;
 use crate::completion::{CompletionContext, CommandBufferState};
+use crate::tool_formatter::{format_tool_detailed, format_tool_compact};
 
 /// Application state with server and tool selection modes
 #[derive(Debug)]
@@ -667,7 +668,8 @@ async fn handle_command_key(mut self, code: KeyCode) -> Result<Self> {
                     .with_message("  :mcp list                - List configured MCP servers".to_string())
                     .with_message("  :mcp cn, :mcp connect    - Connect to MCP server (interactive)".to_string())
                     .with_message("  :mcp status              - Show connection and tools status".to_string())
-                    .with_message("  :mcp tools               - List tools from connected server".to_string())
+                    .with_message("  :mcp tools               - List tools (compact view)".to_string())
+                    .with_message("  :mcp tool <name>         - Show detailed tool description".to_string())
                     .with_message("  :mcp run [tool_name]     - Run MCP tool (interactive or direct)".to_string())
                     .with_message("".to_string())
                     .with_message("  :h, :help                - Show this help".to_string());
@@ -729,128 +731,165 @@ async fn handle_command_key(mut self, code: KeyCode) -> Result<Self> {
                         "⚠️ No tools available. Connect to a server first with :mcp connect".to_string()
                     );
                     self.output = self.output.with_message(
-                        format!("💡 Tip: Use :mcp status to check connection state")
+                        "💡 Tip: Use :mcp status to check connection state".to_string()
                     );
                 } else {
                     self.output = self.output.with_message("📦 Available tools:".to_string());
+                    
                     for (i, tool) in self.available_tools.iter().enumerate() {
-                        let desc_preview = if tool.description.len() > 80 {
-                            format!("{}...", &tool.description[..77])
-                        } else {
-                            tool.description.clone()
-                        };
+                        let compact = format_tool_compact(tool);
                         self.output = self.output.with_message(
-                            format!("  [{}] {}: {}", i + 1, tool.name, desc_preview)
+                            format!("  [{}] {}", i + 1, compact)
                         );
                     }
+                    
+                    self.output = self.output.with_message("".to_string());
                     self.output = self.output.with_message(
-                        format!("Total: {} tools - use :mcp run to execute", self.available_tools.len())
+                        format!("Total: {} tools - use :mcp tool <name> for details", self.available_tools.len())
                     );
                 }
                 self.scroll_to_bottom();
             }
-            Ok(Command::McpStatus) => {
-                self.output = self.output.with_message("📊 MCP Client Status:".to_string());
+        // NEW: McpTool - detailed tool description
+        Ok(Command::McpTool(tool_name)) => {
+            
+            if let Some(tool) = self.available_tools.iter().find(|t| t.name == tool_name) {
+                let detailed_lines = format_tool_detailed(tool);
+                
+                for line in detailed_lines {
+                    self.output = self.output.with_message(line);
+                }
+                
+                self.status = format!("Showing details for '{}'", tool_name);
+            } else {
                 self.output = self.output.with_message(
-                    format!("  • Tools loaded: {}", self.available_tools.len())
+                    format!("❌ Tool '{}' not found", tool_name)
                 );
-                if self.available_tools.is_empty() {
-                    self.output = self.output.with_message(
-                        "  • Status: Not connected or no tools available".to_string()
-                    );
-                    self.output = self.output.with_message(
-                        "  • Action: Use :mcp connect to establish connection".to_string()
-                    );
-                } else {
-                    self.output = self.output.with_message(
-                        "  • Status: Connected with tools loaded".to_string()
-                    );
-                    self.output = self.output.with_message(
-                        "  • Available tools:".to_string()
-                    );
+                
+                if !self.available_tools.is_empty() {
+                    self.output = self.output.with_message("".to_string());
+                    self.output = self.output.with_message("Available tools:".to_string());
+                    
                     for tool in &self.available_tools {
                         self.output = self.output.with_message(
-                            format!("    - {}", tool.name)
+                            format!("  • {}", tool.name)
                         );
                     }
                 }
-                self.scroll_to_bottom();
-                self.status = "Status displayed".into();
+                
+                self.status = format!("Tool '{}' not found", tool_name);
             }
-            Ok(Command::McpRun(tool_name, args)) => {
+            self.scroll_to_bottom();
+        }
 
-
-                if self.available_tools.is_empty() {
+        Ok(Command::McpStatus) => {
+            self.output = self.output.with_message("📊 MCP Client Status:".to_string());
+            self.output = self.output.with_message(
+                format!("  • Tools loaded: {}", self.available_tools.len())
+            );
+            if self.available_tools.is_empty() {
+                self.output = self.output.with_message(
+                    "  • Status: Not connected or no tools available".to_string()
+                );
+                self.output = self.output.with_message(
+                    "  • Action: Use :mcp connect to establish connection".to_string()
+                );
+            } else {
+                self.output = self.output.with_message(
+                    "  • Status: Connected with tools loaded".to_string()
+                );
+                self.output = self.output.with_message(
+                    "  • Available tools:".to_string()
+                );
+                for tool in &self.available_tools {
                     self.output = self.output.with_message(
-                        "⚠️ No tools available. Connect to a server first with :mcp connect".to_string()
+                        format!("    - {}", tool.name)
                     );
-                } else if let Some(name) = tool_name {
-                    // Direct tool call by name
-                    if let Some(tool) = self.available_tools.iter().find(|t| t.name == name) {
+                }
+            }
+            self.scroll_to_bottom();
+            self.status = "Status displayed".into();
+        }
 
-                        self.status = format!("Calling tool '{}'...", tool.name);
-                        match args_to_json(&args, &tool.input_schema) {
-                            Ok(json_args) => {
-                                self.output = self.output.with_message(
-                                    format!("🔧 Calling '{}' with: {}", tool.name, json_args)
-                                );
-                                self.mcp_client.call_tool(tool.name.clone(), json_args).await;
-                            }
-                            Err(e) => { /* szczegółowe błędy */ }
+        Ok(Command::McpRun(tool_name, args)) => {
+            if self.available_tools.is_empty() {
+                self.output = self.output.with_message(
+                    "⚠️ No tools available. Connect to a server first with :mcp connect".to_string()
+                );
+            } else if let Some(name) = tool_name {
+                // Direct tool call by name
+                if let Some(tool) = self.available_tools.iter().find(|t| t.name == name) {
+                    self.status = format!("Calling tool '{}'...", tool.name);
+                    
+                    match args_to_json(&args, &tool.input_schema) {
+                        Ok(json_args) => {
+                            self.output = self.output.with_message(
+                                format!("🔧 Calling '{}' with: {}", tool.name, json_args)
+                            );
+                            self.mcp_client.call_tool(tool.name.clone(), json_args).await;
                         }
-
-
-                        // self.mcp_client.call_tool(tool.name.clone(), serde_json::json!({})).await;
-                    } else {
-                        self.status = format!("Tool '{}' not found", name);
+                        Err(e) => {
+                            self.output = self.output.with_message(
+                                format!("❌ Argument error: {}", e)
+                            );
+                            self.output = self.output.with_message("".to_string());
+                            
+                            // Show usage hint
+                            let usage = crate::args::usage_hint(&tool.name, &tool.input_schema);
+                            self.output = self.output.with_message(
+                                format!("Usage: {}", usage)
+                            );
+                            
+                            self.status = format!("Error: {}", e);
+                        }
                     }
                 } else {
-                    // Interactive tool selection
-                    self.output = self.output.with_message("🔧 Select tool to run:".to_string());
-                    for (i, tool) in self.available_tools.iter().enumerate() {
-                        let prefix = if i == 0 { "→" } else { " " };
-                        let desc_preview = if tool.description.len() > 60 {
-                            format!("{}...", &tool.description[..57])
-                        } else {
-                            tool.description.clone()
-                        };
-                        self.output = self.output.with_message(
-                            format!("  {} [{}] {}: {}", prefix, i + 1, tool.name, desc_preview)
-                        );
-                    }
-                    self.output = self.output
-                        .with_message("".to_string())
-                        .with_message("Use ↑↓ or j/k to navigate, Enter to run, Esc to cancel".to_string());
+                    self.status = format!("Tool '{}' not found", name);
+                }
+            } else {
+                // Interactive tool selection (existing code)
+                self.output = self.output.with_message("🔧 Select tool to run:".to_string());
+                for (i, tool) in self.available_tools.iter().enumerate() {
+                    let prefix = if i == 0 { "→" } else { " " };
+                    let compact = format_tool_compact(tool);
+                    self.output = self.output.with_message(
+                        format!("  {} [{}] {}", prefix, i + 1, compact)
+                    );
+                }
+                self.output = self.output
+                    .with_message("".to_string())
+                    .with_message("Use ↑↓ or j/k to navigate, Enter to run, Esc to cancel".to_string());
 
-                    self.tool_selection = Some(ToolSelection {
-                        tools: self.available_tools.clone(),
-                        selected: 0,
-                    });
-                    self.status = "Select tool with ↑↓ or number keys".into();
-                        }
-                self.scroll_to_bottom();
+                self.tool_selection = Some(ToolSelection {
+                    tools: self.available_tools.clone(),
+                    selected: 0,
+                });
+                self.status = "Select tool with ↑↓ or number keys".into();
             }
-            Ok(Command::Mouse(enabled)) => {
-                self.mouse_enabled = enabled;
-                let state = if enabled { "enabled" } else { "disabled" };
-                self.output = self.output.with_message(
-                    format!("🖱️  Mouse capture {}", state)
-                );
-                self.output = self.output.with_message(
-                    if enabled {
-                        "Mouse events captured by application. Terminal selection disabled.".to_string()
-                    } else {
-                        "Mouse capture disabled. You can now use terminal selection (Ctrl+Shift+C to copy).".to_string()
-                    }
-                );
-                self.scroll_to_bottom();
-                self.status = format!("Mouse capture {}", state);
-            }
-            Err(e) => {
-                self.status = format!("Error: {}", e);
-            }
+            self.scroll_to_bottom();
         }
-            Ok(self)
+
+        Ok(Command::Mouse(enabled)) => {
+            self.mouse_enabled = enabled;
+            let state = if enabled { "enabled" } else { "disabled" };
+            self.output = self.output.with_message(
+                format!("🖱️  Mouse capture {}", state)
+            );
+            self.output = self.output.with_message(
+                if enabled {
+                    "Mouse events captured by application. Terminal selection disabled.".to_string()
+                } else {
+                    "Mouse capture disabled. You can now use terminal selection (Ctrl+Shift+C to copy).".to_string()
+                }
+            );
+            self.scroll_to_bottom();
+            self.status = format!("Mouse capture {}", state);
+        }
+        Err(e) => {
+            self.status = format!("Error: {}", e);
+        }
+    }
+    Ok(self)
         }
 }
 

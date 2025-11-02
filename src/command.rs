@@ -19,6 +19,7 @@ pub enum Command {
     McpConnect(Option<String>),
     McpList,
     McpTools,
+    McpTool(String), // NEW: Show detailed tool description
     McpRun(Option<String>, Vec<String>), // (tool_name, args)
     McpStatus,
     Mouse(bool),
@@ -55,6 +56,12 @@ impl Command {
             ["mcp", "list"] => Ok(Command::McpList),                            
     
             ["mcp", "tools"] => Ok(Command::McpTools),
+            
+            // NEW: Detailed tool description
+            ["mcp", "tool", tool_name] => {
+                Ok(Command::McpTool(tool_name.to_string()))
+            }
+            
             ["mcp", "run"] => Ok(Command::McpRun(None, vec![])),
             ["mcp", "run", tool_name, args @ ..] => {
                 Ok(Command::McpRun(Some(tool_name.to_string()), args.iter().map(|s| s.to_string()).collect()))
@@ -108,6 +115,14 @@ mod tests {
     #[test]
     fn test_mcp_tools_command() {
         assert_eq!(Command::parse("mcp tools"), Ok(Command::McpTools));
+    }
+
+    #[test]
+    fn test_mcp_tool_command() {
+        assert_eq!(
+            Command::parse("mcp tool search_components"),
+            Ok(Command::McpTool("search_components".into()))
+        );
     }
 
     #[test]

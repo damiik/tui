@@ -8,3 +8,4 @@ pub mod state;
 pub mod ui;
 pub mod args;
 pub mod completion;
+pub mod tool_formatter;
