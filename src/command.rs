@@ -19,8 +19,8 @@ pub enum Command {
     McpConnect(Option<String>),
     McpList,
     McpTools,
-    McpRun(Option<String>),
-    McpStatus, // New: show connection status
+    McpRun(Option<String>, Vec<String>), // (tool_name, args)
+    McpStatus,
     Mouse(bool),
 }
 
@@ -52,10 +52,13 @@ impl Command {
             ["mcp", "cn", name] | ["mcp", "connect", name] => {
                 Ok(Command::McpConnect(Some(name.to_string())))
             }
-            ["mcp", "list"] => Ok(Command::McpList),
+            ["mcp", "list"] => Ok(Command::McpList),                            
+    
             ["mcp", "tools"] => Ok(Command::McpTools),
-            ["mcp", "run"] => Ok(Command::McpRun(None)),
-            ["mcp", "run", name] => Ok(Command::McpRun(Some(name.to_string()))),
+            ["mcp", "run"] => Ok(Command::McpRun(None, vec![])),
+            ["mcp", "run", tool_name, args @ ..] => {
+                Ok(Command::McpRun(Some(tool_name.to_string()), args.iter().map(|s| s.to_string()).collect()))
+            }
             ["mcp", "status"] => Ok(Command::McpStatus),
             ["mouse", "on"] => Ok(Command::Mouse(true)),
             ["mouse", "off"] => Ok(Command::Mouse(false)),
@@ -114,6 +117,11 @@ mod tests {
             Command::parse("mcp run get_view_state"),
             Ok(Command::McpRun(Some("get_view_state".into())))
         );
+    }
+
+    #[test]
+    fn test_mcp_status_command() {
+        assert_eq!(Command::parse("mcp status"), Ok(Command::McpStatus));
     }
 
     #[test]

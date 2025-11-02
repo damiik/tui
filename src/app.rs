@@ -4,6 +4,7 @@ use crate::event::Event;
 use crate::mcp::{McpClient, McpClientEvent, ToolInfo};
 use crate::mode::Mode;
 use crate::state::{Buffer, OutputLog};
+use crate::args::{args_to_json, usage_hint};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyModifiers};
 use tokio::sync::mpsc;
@@ -404,10 +405,10 @@ impl App {
             KeyCode::Char('q') => {
                 self.quit = true;
             }
-            KeyCode::PageUp => {
+            KeyCode::PageUp | KeyCode::Char('k') => {
                 self.scroll_up();
             }
-            KeyCode::PageDown => {
+            KeyCode::PageDown | KeyCode::Char('j') => {
                 self.scroll_down();
             }
             KeyCode::End => {
@@ -533,14 +534,8 @@ impl App {
                 self.status = "Output cleared".into();
             }
             Ok(Command::Echo(msg)) => {
-                let msgc = msg.clone();
-                let msg_string = msgc.to_string();
-                let msgv = msg_string.split(' ').collect::<Vec<&str>>();
-                for m in msgv.clone() {
-                    self.output = self.output.with_message("dupa".to_string());//m.to_string());
-                    self.scroll_to_bottom();
-                }
-                self.status = format!("Echoed");// {}", &msgv.get(0).unwrap_or(&"")); // Show first line only
+                self.output = self.output.with_message(msg.clone());
+                self.status = format!("Echoed: {}", msg);
             }
             Ok(Command::Help) => {
                 self.output = self.output
@@ -664,7 +659,9 @@ impl App {
                 self.scroll_to_bottom();
                 self.status = "Status displayed".into();
             }
-            Ok(Command::McpRun(tool_name)) => {
+            Ok(Command::McpRun(tool_name, args)) => {
+
+
                 if self.available_tools.is_empty() {
                     self.output = self.output.with_message(
                         "⚠️ No tools available. Connect to a server first with :mcp connect".to_string()
@@ -672,8 +669,20 @@ impl App {
                 } else if let Some(name) = tool_name {
                     // Direct tool call by name
                     if let Some(tool) = self.available_tools.iter().find(|t| t.name == name) {
+
                         self.status = format!("Calling tool '{}'...", tool.name);
-                        self.mcp_client.call_tool(tool.name.clone(), serde_json::json!({})).await;
+                        match args_to_json(&args, &tool.input_schema) {
+                            Ok(json_args) => {
+                                self.output = self.output.with_message(
+                                    format!("🔧 Calling '{}' with: {}", tool.name, json_args)
+                                );
+                                self.mcp_client.call_tool(tool.name.clone(), json_args).await;
+                            }
+                            Err(e) => { /* szczegółowe błędy */ }
+                        }
+
+
+                        // self.mcp_client.call_tool(tool.name.clone(), serde_json::json!({})).await;
                     } else {
                         self.status = format!("Tool '{}' not found", name);
                     }
