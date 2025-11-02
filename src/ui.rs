@@ -52,51 +52,61 @@ impl UI {
     // Output area rendering
     // ═══════════════════════════════════════════════════════════════
 
-    fn render_output(&self, frame: &mut Frame, app: &App, area: Rect) {
-        let lines: Vec<Line> = app
-            .output()
-            .iter()
-            .map(|s| Line::from(s.as_str()))
-            .collect();
+fn render_output(&self, frame: &mut Frame, app: &App, area: Rect) {
+    let lines: Vec<Line> = app
+        .output()
+        .iter()
+        .map(|s| Line::from(s.as_str()))
+        .collect();
 
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray))
-            .title(Span::styled(
-                " Output ",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(Span::styled(
+            " Output ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
 
-        let paragraph = Paragraph::new(lines)
-            .block(block)
-            .wrap(Wrap { trim: false })
-            .scroll((app.scroll_offset(), 0));
+    // CRITICAL: Verify scroll offset calculation
+    let scroll_offset = app.scroll_offset();
+    
+    // DEBUG: Add temporary logging (remove in production)
+    // eprintln!("DEBUG render_output:");
+    // eprintln!("  area.height = {}", area.height);
+    // eprintln!("  lines.len() = {}", lines.len());
+    // eprintln!("  scroll_offset = {}", scroll_offset);
+    // eprintln!("  view_height = {}", area.height.saturating_sub(2));
 
-        frame.render_widget(paragraph, area);
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll_offset, 0));
 
-        // Render scrollbar if content exceeds visible area
-        let content_length = app.output().len();
-        if content_length > area.height as usize - 2 {
-            let scrollbar = Scrollbar::default()
-                .orientation(ScrollbarOrientation::VerticalRight)
-                .begin_symbol(Some("↑"))
-                .end_symbol(Some("↓"));
+    frame.render_widget(paragraph, area);
 
-            let mut scrollbar_state = ScrollbarState::new(content_length)
-                .position(app.scroll_offset() as usize);
+    // Scrollbar rendering (existing code)
+    let content_length = app.output().len();
+    if content_length > area.height as usize - 2 {
+        let scrollbar = Scrollbar::default()
+            .orientation(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(Some("↑"))
+            .end_symbol(Some("↓"));
 
-            frame.render_stateful_widget(
-                scrollbar,
-                area.inner(ratatui::layout::Margin {
-                    vertical: 1,
-                    horizontal: 0,
-                }),
-                &mut scrollbar_state,
-            );
-        }
+        let mut scrollbar_state = ScrollbarState::new(content_length)
+            .position(scroll_offset as usize);
+
+        frame.render_stateful_widget(
+            scrollbar,
+            area.inner(ratatui::layout::Margin {
+                vertical: 1,
+                horizontal: 0,
+            }),
+            &mut scrollbar_state,
+        );
     }
+}
 
     // ═══════════════════════════════════════════════════════════════
     // Status bar rendering - shows mode and status message

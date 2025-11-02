@@ -88,8 +88,14 @@ impl App {
     // ═══════════════════════════════════════════════════════════════
 
     pub fn set_output_height(&mut self, height: u16) {
-        // Account for: output borders (2) + status line (1) + input line (1) = 4
-        self.output_height = height.saturating_sub(4);
+        // Store the WIDGET height (including borders)
+        self.output_height = height;
+        
+        // DEBUG
+        //eprintln!("DEBUG set_output_height: height={}, content_lines={}", 
+        //         height, self.output.lines().len());
+        
+        // Recalculate scroll on resize
         self.scroll_to_bottom();
     }
 
@@ -100,14 +106,26 @@ impl App {
     // ═══════════════════════════════════════════════════════════════
 
     fn view_height(&self) -> u16 {
-        // The actual visible content area (excluding borders)
-        self.output_height.saturating_sub(2)
+        // Visible content lines (excluding borders)
+        let vh = self.output_height.saturating_sub(2);
+        
+        // DEBUG
+        //eprintln!("DEBUG view_height: output_height={}, view_height={}", 
+        //          self.output_height, vh);
+        
+        vh
     }
 
     fn max_scroll_offset(&self) -> u16 {
         let content_len = self.output.lines().len() as u16;
         let view_height = self.view_height();
-        content_len.saturating_sub(view_height)
+        let max_offset = content_len.saturating_sub(view_height);
+        
+        // DEBUG
+        //eprintln!("DEBUG max_scroll_offset: content={}, view={}, max={}", 
+        //          content_len, view_height, max_offset);
+
+        max_offset
     }
 
     fn enable_autoscroll(&mut self) {
@@ -122,9 +140,14 @@ impl App {
     /// This is the primary method for auto-scrolling.
     fn scroll_to_bottom(&mut self) {
         if self.autoscroll {
-            self.scroll_offset = self.max_scroll_offset();
+            let max = self.max_scroll_offset();
+            self.scroll_offset = max;
+            
+            // DEBUG
+            //eprintln!("DEBUG scroll_to_bottom: setting scroll_offset to {}", max);
         }
     }
+
 
     /// Scrolls up one line, disabling autoscroll.
     fn scroll_up(&mut self) {
@@ -134,11 +157,16 @@ impl App {
 
     /// Scrolls down one line. If the bottom is reached, re-enables autoscroll.
     fn scroll_down(&mut self) {
-        self.disable_autoscroll(); // Assume manual scroll until we check position
+        self.disable_autoscroll();
         let max_offset = self.max_scroll_offset();
+        
+        //eprintln!("DEBUG scroll_down: current={}, max={}", self.scroll_offset, max_offset);
+        
         if self.scroll_offset < max_offset {
             self.scroll_offset += 1;
         }
+        
+        // Re-enable autoscroll if at bottom
         if self.scroll_offset >= max_offset {
             self.enable_autoscroll();
         }
