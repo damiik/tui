@@ -1,10 +1,11 @@
 use crate::app::App;
 use crate::mode::Mode;
+use crate::completion::CompletionResult;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
+    widgets::{Block, Borders, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
     Frame,
 };
 
@@ -18,13 +19,13 @@ impl UI {
     }
 
     /// Pure function: Frame × App → ()
-    pub fn render(&self, frame: &mut Frame, app: &App) {
-        let layout = Self::create_layout(frame.area());
+    // pub fn render(&self, frame: &mut Frame, app: &App) {
+    //     let layout = Self::create_layout(frame.area());
 
-        self.render_output(frame, app, layout.output);
-        self.render_status_bar(frame, app, layout.status);
-        self.render_input_line(frame, app, layout.input);
-    }
+    //     self.render_output(frame, app, layout.output);
+    //     self.render_status_bar(frame, app, layout.status);
+    //     self.render_input_line(frame, app, layout.input);
+    // }
 
     // ═══════════════════════════════════════════════════════════════
     // Layout composition
@@ -196,6 +197,107 @@ impl UI {
             }
         }
     }
+
+    /// Render completion popup above input line (Vim-style)
+    fn render_completion_popup(
+        &self,
+        frame: &mut Frame,
+        completion: &CompletionResult,
+        input_area: Rect,
+    ) {
+        if completion.is_empty() {
+            return;
+        }
+
+        // Calculate popup dimensions
+        let max_width = completion.candidates
+            .iter()
+            .map(|c| {
+                let desc_len = c.description.as_ref().map_or(0, |d| d.len());
+                c.text.len() + desc_len + 4 // padding
+            })
+            .max()
+            .unwrap_or(20)
+            .min(120) as u16;
+
+        let height = (completion.len().min(30) as u16) + 2; // max 10 items + borders
+
+        // Position above input line
+        let popup_area = Rect {
+            x: input_area.x.saturating_add(1), // Offset by ":" character
+            y: input_area.y.saturating_sub(height),
+            width: max_width,
+            height,
+        };
+
+        // Create list items
+        let items: Vec<ListItem> = completion.candidates
+            .iter()
+            .enumerate()
+            .map(|(i, candidate)| {
+                let is_selected = i == completion.selected;
+                
+                let text = if let Some(desc) = &candidate.description {
+                    format!("  {:<20} {}", candidate.text, desc)
+                } else {
+                    format!("  {}", candidate.text)
+                };
+
+                let style = if is_selected {
+                    Style::default()
+                        .bg(Color::Blue)
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                        .fg(Color::White)
+                };
+
+                let prefix = if is_selected { "▶" } else { " " };
+                let line = Line::from(vec![
+                    Span::styled(prefix, style),
+                    Span::styled(text, style),
+                ]);
+
+                ListItem::new(line)
+            })
+            .collect();
+
+        // Create list widget
+        let list = List::new(items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Yellow))
+                    .title(Span::styled(
+                        " Completions ",
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ))
+            )
+            .style(Style::default().bg(Color::Black));
+
+        // Render with higher z-index (last)
+        frame.render_widget(list, popup_area);
+    }    
+
+    // Update the main render method to include completion popup
+    pub fn render(&self, frame: &mut Frame, app: &App) {
+        let layout = Self::create_layout(frame.area());
+
+        self.render_output(frame, app, layout.output);
+        self.render_status_bar(frame, app, layout.status);
+        self.render_input_line(frame, app, layout.input);
+
+        // NEW: Render completion popup if active
+        if let Some(completion) = app.completion_popup() {
+            if app.mode() == Mode::Command {
+                self.render_completion_popup(frame, completion, layout.input);
+            }
+        }
+    }    
+
 }
 
 

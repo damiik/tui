@@ -7,3 +7,4 @@ pub mod mode;
 pub mod state;
 pub mod ui;
 pub mod args;
+pub mod completion;

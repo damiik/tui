@@ -8,6 +8,7 @@ use crate::args::{args_to_json, usage_hint};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyModifiers};
 use tokio::sync::mpsc;
+use crate::completion::{CompletionContext, CommandBufferState};
 
 /// Application state with server and tool selection modes
 #[derive(Debug)]
@@ -15,7 +16,7 @@ pub struct App {
     mode: Mode,
     output: OutputLog,
     input_buffer: Buffer,
-    command_buffer: Buffer,
+    // command_buffer: Buffer,
     status: String,
     quit: bool,
     mcp_client: McpClient,
@@ -28,6 +29,8 @@ pub struct App {
     scroll_offset: u16,
     autoscroll: bool,
     output_height: u16,
+    command_state: CommandBufferState,
+    completion_context: CompletionContext,
 }
 
 #[derive(Debug)]
@@ -47,12 +50,23 @@ impl App {
         let (mcp_event_tx, mcp_event_rx) = mpsc::channel(100);
         let mcp_client = McpClient::new(mcp_event_tx);
 
+        // Extract server names for completion
+        let server_names: Vec<String> = config.mcp_servers
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+
+        // Initialize completion context with server names
+        let completion_context = CompletionContext::new()
+            .with_list("mcp_servers".to_string(), server_names);
+
         Self {
             mode: Mode::Normal,
             output: OutputLog::new()
                 .with_message("MCP Client initialized. Press 'i' for INSERT mode.".to_string()),
             input_buffer: Buffer::new(),
-            command_buffer: Buffer::new(),
+            command_state: CommandBufferState::new(), // NEW
+            completion_context,                       // NEW
             status: "Ready".into(),
             quit: false,
             mcp_client,
@@ -153,13 +167,13 @@ impl App {
     }
 
     pub fn command_buffer(&self) -> &str {
-        self.command_buffer.content()
+        &self.command_state.content
     }
 
     pub fn cursor_pos(&self) -> usize {
         match self.mode {
             Mode::Insert => self.input_buffer.cursor(),
-            Mode::Command => self.command_buffer.cursor(),
+            Mode::Command => self.command_state.cursor,
             Mode::Normal => 0,
         }
     }
@@ -183,6 +197,10 @@ impl App {
     pub const fn mouse_enabled(&self) -> bool {
         self.mouse_enabled
     }
+    // NEW: Accessor for completion state
+    pub fn completion_popup(&self) -> Option<&crate::completion::CompletionResult> {
+        self.command_state.completion.as_ref()
+    }    
 
     // ═══════════════════════════════════════════════════════════════
     // Event handler: Self → Event → Result<Self>
@@ -224,6 +242,14 @@ impl App {
                 // CRITICAL: Store tools in App state FIRST
                 self.available_tools = tools.clone();
                 
+               // NEW: Register tool names for completion
+                let tool_names: Vec<String> = tools
+                    .iter()
+                    .map(|t| t.name.clone())
+                    .collect();
+                self.completion_context = self.completion_context
+                    .with_list("mcp_tools".to_string(), tool_names);
+            
                 self.output = self.output.with_message(
                     format!("✅ Stored {} tools in App state", self.available_tools.len())
                 );
@@ -399,7 +425,7 @@ impl App {
             }
             KeyCode::Char(':') => {
                 self.mode = Mode::Command;
-                self.command_buffer = Buffer::new();
+                // self.command_buffer = Buffer::new();
                 self.status = "Entered COMMAND mode".into();
             }
             KeyCode::Char('q') => {
@@ -468,31 +494,123 @@ impl App {
     // Mode: COMMAND
     // ═══════════════════════════════════════════════════════════════
 
-    async fn handle_command_key(mut self, code: KeyCode) -> Result<Self> {
-        match code {
-            KeyCode::Esc => {
-                self.mode = Mode::Normal;
-                self.command_buffer = Buffer::new();
-                self.status = "Command cancelled".into();
-                Ok(self)
-            }
-            KeyCode::Enter => {
-                let cmd_text = self.command_buffer.content().to_string();
-                let mut app = self.execute_command(&cmd_text).await?;
-                app.mode = Mode::Normal;
-                app.command_buffer = Buffer::new();
-                Ok(app)
-            }
-            KeyCode::Char(c) => {
-                self.command_buffer = self.command_buffer.insert_char(c);
-                Ok(self)
-            }
-            KeyCode::Backspace => {
-                self.command_buffer = self.command_buffer.delete_char();
-                Ok(self)
-            }
-            _ => Ok(self),
+async fn handle_command_key(mut self, code: KeyCode) -> Result<Self> {
+    match code {
+        KeyCode::Esc => {
+            self.mode = Mode::Normal;
+            self.command_state = CommandBufferState::new();
+            self.status = "Command cancelled".into();
+            Ok(self)
         }
+
+        // Tab - trigger completion
+        KeyCode::Tab => {
+            let result = self.completion_context.complete(&self.command_state.content);
+            self.command_state = self.command_state.with_completion(result);
+            Ok(self)
+        }
+
+        // Enter - execute or apply completion
+        KeyCode::Enter => {
+            // If completion popup is active, apply selected completion
+            if self.command_state.completion.is_some() {
+                self.command_state = self.command_state.apply_completion();
+                return Ok(self);
+            }
+
+            // Execute command
+            let cmd_text = self.command_state.content.clone();
+            let mut app = self.execute_command(&cmd_text).await?;
+            
+            // Add to history
+            app.completion_context = app.completion_context
+                .with_history_entry(cmd_text);
+            
+            app.mode = Mode::Normal;
+            app.command_state = CommandBufferState::new();
+            Ok(app)
+        }
+
+        // Up/Down navigation
+        KeyCode::Up | KeyCode::Char('k') => {
+            if self.command_state.completion.is_some() {
+                // Navigate completion popup
+                if let Some(comp) = self.command_state.completion.take() {
+                    self.command_state.completion = Some(comp.prev());
+                }
+            } else {
+                // Navigate history
+                if self.command_state.history_index.is_none() {
+                    self.command_state.saved_text = Some(self.command_state.content.clone());
+                }
+                if let Some((text, idx)) = self.completion_context.history_up(
+                    self.command_state.history_index
+                ) {
+                    self.command_state = self.command_state.set_text(text);
+                    self.command_state.history_index = Some(idx);
+                }
+            }
+            Ok(self)
+        }
+
+        KeyCode::Down | KeyCode::Char('j') => {
+            if self.command_state.completion.is_some() {
+                // Navigate completion popup
+                if let Some(comp) = self.command_state.completion.take() {
+                    self.command_state.completion = Some(comp.next());
+                }
+            } else {
+                // Navigate history
+                match self.completion_context.history_down(self.command_state.history_index) {
+                    Some((text, idx)) => {
+                        self.command_state = self.command_state.set_text(text);
+                        self.command_state.history_index = Some(idx);
+                    }
+                    None => {
+                        // Restore original text
+                        if let Some(saved) = self.command_state.saved_text.take() {
+                            self.command_state = self.command_state.set_text(saved);
+                            self.command_state.history_index = None;
+                        }
+                    }
+                }
+            }
+            Ok(self)
+        }
+
+        // Text editing
+        KeyCode::Char(c) => {
+            self.command_state = self.command_state.with_char(c);
+            Ok(self)
+        }
+
+        KeyCode::Backspace => {
+            self.command_state = self.command_state.delete_char();
+            Ok(self)
+        }
+
+        KeyCode::Left => {
+            self.command_state = self.command_state.move_left();
+            Ok(self)
+        }
+
+        KeyCode::Right => {
+            self.command_state = self.command_state.move_right();
+            Ok(self)
+        }
+
+        KeyCode::Home => {
+            self.command_state = self.command_state.move_start();
+            Ok(self)
+        }
+
+        KeyCode::End => {
+            self.command_state = self.command_state.move_end();
+            Ok(self)
+        }
+
+        _ => Ok(self),
+    }
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -516,7 +634,7 @@ impl App {
             _ => {}
         }
         Ok(self)
-    }
+            }
 
     // ═══════════════════════════════════════════════════════════════
     // Command execution
@@ -709,7 +827,7 @@ impl App {
                         selected: 0,
                     });
                     self.status = "Select tool with ↑↓ or number keys".into();
-                }
+                        }
                 self.scroll_to_bottom();
             }
             Ok(Command::Mouse(enabled)) => {
@@ -732,15 +850,15 @@ impl App {
                 self.status = format!("Error: {}", e);
             }
         }
-        Ok(self)
-    }
+            Ok(self)
+        }
 }
 
 impl Default for App {
     fn default() -> Self {
         let config = Config::from_file("config.json").unwrap();
         Self::new(config)
-    }
+        }
 }
 
 impl ServerSelection {
