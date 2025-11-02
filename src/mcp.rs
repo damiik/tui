@@ -7,6 +7,32 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use std::sync::atomic::{AtomicI64, Ordering};
 use tokio::time::sleep;
+use tokio::task;
+
+// helper function for safe JSON formatting
+async fn format_json_safely(value: &serde_json::Value) -> String {
+    let value_clone = value.clone();
+    
+    // Run formatting in blocking task to prevent UI freeze
+    match task::spawn_blocking(move || {
+        serde_json::to_string_pretty(&value_clone)
+    }).await {
+        Ok(Ok(formatted)) => formatted,
+        _ => value.to_string(), // Fallback to compact format
+    }
+}
+
+// helper to truncate large JSON
+fn truncate_json_display(json_str: &str, max_lines: usize) -> (String, bool) {
+    let lines: Vec<&str> = json_str.lines().collect();
+    
+    if lines.len() <= max_lines {
+        (json_str.to_string(), false)
+    } else {
+        let truncated = lines[..max_lines].join("\n");
+        (truncated, true)
+    }
+}
 
 // ═══════════════════════════════════════════════════════════════
 // EVENTS
@@ -33,6 +59,7 @@ pub enum McpClientEvent {
     Error(String),
     ToolsListed(Vec<ToolInfo>),
     Debug(String),
+    LargeResponse { total_lines: usize, chunk: String },
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -477,7 +504,7 @@ async fn handle_json_rpc_event(
     pending: &Arc<Mutex<HashMap<i64, oneshot::Sender<serde_json::Value>>>>,
     available_tools: &Arc<Mutex<Vec<ToolInfo>>>,
 ) {
-    // Obsługa odpowiedzi (z id)
+    // Handle responses (with id)
     if let Some(id) = v.get("id").and_then(|v| v.as_i64()) {
 
 
@@ -486,9 +513,7 @@ async fn handle_json_rpc_event(
 
 
             if let Some(result) = v.get("result") {
-                // let _ = tx.send(result.clone());
-
-                // Specjalna obsługa tools/list
+            // Special handling for tools/list
                 if let Some(tools) = result.get("tools") {
                     if let Some(tools_array) = tools.as_array() {
                         let tool_infos: Vec<ToolInfo> = tools_array
@@ -503,7 +528,7 @@ async fn handle_json_rpc_event(
                             .collect();
 
                         if !tool_infos.is_empty() {
-                            // Zapisz narzędzia w pamięci
+                            // Store tools in memory
                             {
                                 let mut tools_lock = available_tools.lock().await;
                                 *tools_lock = tool_infos.clone();
@@ -521,32 +546,65 @@ async fn handle_json_rpc_event(
                     }
                 }
 
-                // Obsługa tools/call result
+                // FIXED: Handle tools/call result with formatted JSON
                 if let Some(content) = result.get("content") {
                     if let Some(content_array) = content.as_array() {
                         for item in content_array {
                             if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                            // Try to parse as JSON for pretty formatting
+                            if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(text) {
+                                let formatted = format_json_safely(&json_value).await;
+                                
+                                // FIXED: Truncate large responses
+                                let (display_text, truncated) = truncate_json_display(&formatted, 200);
+                                
+                                let _ = event_tx.send(McpClientEvent::Message(
+                                    "📋 Tool result:".to_string()
+                                )).await;
+                                
+                                let _ = event_tx.send(McpClientEvent::Message(display_text)).await;
+                                
+                                if truncated {
+                                    let total_lines = formatted.lines().count();
+                                    let _ = event_tx.send(McpClientEvent::Message(
+                                        format!("\n⚠️  Response truncated: showing 200 of {} lines", total_lines)
+                                    )).await;
+                                    let _ = event_tx.send(McpClientEvent::Message(
+                                        "💡 Tip: Large responses may cause display issues".to_string()
+                                    )).await;
+                                }
+                            } else {
+                                // Not JSON, display as-is
                                 let _ = event_tx.send(McpClientEvent::Message(
                                     format!("📋 Tool result:\n{}", text)
                                 )).await;
                             }
                         }
+                    }
                         return;
                     }
                 }
 
+            // FIXED: Format any other result as pretty JSON
+            let formatted = format_json_safely(result).await;
+            let (display_text, truncated) = truncate_json_display(&formatted, 200);
+            
+            let _ = event_tx.send(McpClientEvent::Message(display_text)).await;
+            
+            if truncated {
+                let total_lines = formatted.lines().count();
                 let _ = event_tx.send(McpClientEvent::Message(
-                    serde_json::to_string_pretty(result).unwrap_or_default()
+                    format!("\n⚠️  Response truncated: showing 200 of {} lines", total_lines)
                 )).await;
+            }
             } else if let Some(error) = v.get("error") {
+            // FIXED: Format error as pretty JSON
+            let formatted = format_json_safely(error).await;
                 let _ = event_tx.send(McpClientEvent::Error(
-                    format!("RPC error: {}", 
-                        serde_json::to_string_pretty(error).unwrap_or_default()
-                    )
+                format!("RPC error:\n{}", formatted)
                 )).await;
             }
             return;
-       // }
     }
 
     // Handle notifications (no id)

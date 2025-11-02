@@ -423,6 +423,14 @@ impl CompletionContext {
                 self.complete_from_list("mcp_servers", prefix)
             }
             
+            // FIXED: After "mcp tool" - tool name for detailed description
+            ["tool"] if ends_with_space => {
+                self.complete_from_list("mcp_tools", "")
+            }
+            ["tool", prefix] if !ends_with_space => {
+                self.complete_from_list("mcp_tools", prefix)
+            }
+            
             // After "mcp run" - tool name
             ["run"] if ends_with_space => {
                 self.complete_from_list("mcp_tools", "")
@@ -430,7 +438,7 @@ impl CompletionContext {
             ["run", prefix] if !ends_with_space => {
                 self.complete_from_list("mcp_tools", prefix)
             }
-            ["run", _tool, args @ ..] => {
+            ["run", _tool, _args @ ..] => {
                 // TODO: Tool-specific argument completion
                 CompletionResult::empty()
             }

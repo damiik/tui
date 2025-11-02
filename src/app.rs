@@ -88,17 +88,20 @@ impl App {
     // ═══════════════════════════════════════════════════════════════
 
     pub fn set_output_height(&mut self, height: u16) {
-        self.output_height = height;
-        // Recalculate scroll on resize
+        // Account for: output borders (2) + status line (1) + input line (1) = 4
+        self.output_height = height.saturating_sub(4);
         self.scroll_to_bottom();
     }
+
+
 
     // ═══════════════════════════════════════════════════════════════
     // Scrolling methods
     // ═══════════════════════════════════════════════════════════════
 
     fn view_height(&self) -> u16 {
-        self.output_height.saturating_sub(2) // Account for paragraph borders
+        // The actual visible content area (excluding borders)
+        self.output_height.saturating_sub(2)
     }
 
     fn max_scroll_offset(&self) -> u16 {
@@ -223,6 +226,12 @@ impl App {
 
     async fn handle_mcp_event(mut self, event: McpClientEvent) -> Result<Self> {
         match event {
+
+            McpClientEvent::LargeResponse { total_lines, chunk } => {
+                self.output = self.output.with_message(chunk);
+                self.status = format!("Receiving large response ({} lines)...", total_lines);
+                self.scroll_to_bottom();
+            }
             McpClientEvent::Connected => {
                 self.status = "MCP client connected".into();
             }

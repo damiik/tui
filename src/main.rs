@@ -52,7 +52,7 @@ async fn run_loop(
         // Update app state with current UI geometry
         let size = terminal.size()?;
         if size != last_size {
-            let output_height = size.height.saturating_sub(2); // Total height - status bar - input line
+            let output_height = size.height.saturating_sub(4); // Total height - status bar - input line
             app.set_output_height(output_height);
             last_size = size;
         }
