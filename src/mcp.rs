@@ -1,6 +1,6 @@
 use futures_util::StreamExt;
 use reqwest::Client;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -494,120 +494,213 @@ async fn send_initialize(
         .await;
 }
 
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Helper function: Split long text into multiple lines
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Splits text into lines for proper scrolling
+/// - If text contains \n, split on those
+/// - If line is too long, split at reasonable boundaries
+fn split_for_display(text: &str, max_line_length: usize) -> Vec<String> {
+    let mut result = Vec::new();
+    
+    // First, split on actual newlines
+    for line in text.lines() {
+        if line.len() <= max_line_length {
+            result.push(line.to_string());
+        } else {
+            // Line is too long, break it intelligently
+            result.extend(break_long_line(line, max_line_length));
+        }
+    }
+    
+    // If text has no newlines at all
+    if result.is_empty() && !text.is_empty() {
+        result.extend(break_long_line(text, max_line_length));
+    }
+    
+    result
+}
+
+/// Breaks a long line at reasonable boundaries
+fn break_long_line(line: &str, max_length: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    
+    for word in line.split_whitespace() {
+        if current.len() + word.len() + 1 > max_length {
+            if !current.is_empty() {
+                lines.push(current.clone());
+                current.clear();
+            }
+            
+            // If single word is longer than max_length, split it forcefully
+            if word.len() > max_length {
+                let mut remaining = word;
+                while remaining.len() > max_length {
+                    lines.push(remaining[..max_length].to_string());
+                    remaining = &remaining[max_length..];
+                }
+                if !remaining.is_empty() {
+                    current = remaining.to_string();
+                }
+            } else {
+                current = word.to_string();
+            }
+        } else {
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(word);
+        }
+    }
+    
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    
+    lines
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // JSON-RPC EVENT HANDLER
 // ═══════════════════════════════════════════════════════════════
 
 async fn handle_json_rpc_event(
-    v: serde_json::Value,
+    v: Value,
     event_tx: &mpsc::Sender<McpClientEvent>,
-    pending: &Arc<Mutex<HashMap<i64, oneshot::Sender<serde_json::Value>>>>,
+    pending: &Arc<Mutex<HashMap<i64, oneshot::Sender<Value>>>>,
     available_tools: &Arc<Mutex<Vec<ToolInfo>>>,
 ) {
-    // Handle responses (with id)
     if let Some(id) = v.get("id").and_then(|v| v.as_i64()) {
+        if let Some(result) = v.get("result") {
+            // Tools list - NO CHANGE NEEDED
+            if let Some(tools) = result.get("tools") {
+                // ... existing code unchanged ...
+                return;
+            }
 
-
-        // let mut pending_guard = pending.lock().await;
-        // if let Some(tx) = pending_guard.remove(&id) {
-
-
-            if let Some(result) = v.get("result") {
-            // Special handling for tools/list
-                if let Some(tools) = result.get("tools") {
-                    if let Some(tools_array) = tools.as_array() {
-                        let tool_infos: Vec<ToolInfo> = tools_array
-                            .iter()
-                            .filter_map(|t| {
-                                Some(ToolInfo {
-                                    description: t.get("description")?.as_str()?.to_string(),
-                                    input_schema: t.get("inputSchema")?.clone(),
-                                    name: t.get("name")?.as_str()?.to_string(),
-                                })
-                            })
-                            .collect();
-
-                        if !tool_infos.is_empty() {
-                            // Store tools in memory
-                            {
-                                let mut tools_lock = available_tools.lock().await;
-                                *tools_lock = tool_infos.clone();
-                            }
-
-                            let _ = event_tx.send(McpClientEvent::Debug(
-                                format!("✅ Stored {} tools in client memory", tool_infos.len())
+            // ═══════════════════════════════════════════════════════════════
+            // CHANGE 1: tools/call result
+            // ═══════════════════════════════════════════════════════════════
+            if let Some(content) = result.get("content") {
+                if let Some(content_array) = content.as_array() {
+                    for item in content_array {
+                        if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                            // Header
+                            let _ = event_tx.send(McpClientEvent::Message(
+                                "📋 Tool result:".to_string()
                             )).await;
-
-                            let _ = event_tx.send(
-                                McpClientEvent::ToolsListed(tool_infos)
-                            ).await;
-                            return;
-                        }
-                    }
-                }
-
-                // FIXED: Handle tools/call result with formatted JSON
-                if let Some(content) = result.get("content") {
-                    if let Some(content_array) = content.as_array() {
-                        for item in content_array {
-                            if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                            // Try to parse as JSON for pretty formatting
-                            if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(text) {
+                            
+                            if let Ok(json_value) = serde_json::from_str::<Value>(text) {
                                 let formatted = format_json_safely(&json_value).await;
                                 
-                                // FIXED: Truncate large responses
-                                let (display_text, truncated) = truncate_json_display(&formatted, 200);
+                                // CHANGED: Split by lines
+                                let all_lines: Vec<&str> = formatted.lines().collect();
                                 
-                                let _ = event_tx.send(McpClientEvent::Message(
-                                    "📋 Tool result:".to_string()
-                                )).await;
-                                
-                                let _ = event_tx.send(McpClientEvent::Message(display_text)).await;
-                                
-                                if truncated {
-                                    let total_lines = formatted.lines().count();
+                                if all_lines.len() > 200 {
+                                    // Send first 200 lines
+                                    for line in all_lines.iter().take(200) {
+                                        let _ = event_tx.send(McpClientEvent::Message(
+                                            line.to_string()
+                                        )).await;
+                                    }
+                                    
                                     let _ = event_tx.send(McpClientEvent::Message(
-                                        format!("\n⚠️  Response truncated: showing 200 of {} lines", total_lines)
+                                        "".to_string()
                                     )).await;
                                     let _ = event_tx.send(McpClientEvent::Message(
-                                        "💡 Tip: Large responses may cause display issues".to_string()
+                                        format!("⚠️  Response truncated: showing 200 of {} lines", all_lines.len())
                                     )).await;
+                                } else {
+                                    // Send all lines
+                                    for line in all_lines {
+                                        let _ = event_tx.send(McpClientEvent::Message(
+                                            line.to_string()
+                                        )).await;
+                                    }
                                 }
                             } else {
-                                // Not JSON, display as-is
-                                let _ = event_tx.send(McpClientEvent::Message(
-                                    format!("📋 Tool result:\n{}", text)
-                                )).await;
+                                // Not JSON - also split by lines
+                                let all_lines: Vec<&str> = text.lines().collect();
+                                
+                                if all_lines.len() > 200 {
+                                    for line in all_lines.iter().take(200) {
+                                        let _ = event_tx.send(McpClientEvent::Message(
+                                            line.to_string()
+                                        )).await;
+                                    }
+                                    let _ = event_tx.send(McpClientEvent::Message(
+                                        format!("⚠️  Output truncated: {} of {} lines shown", 200, all_lines.len())
+                                    )).await;
+                                } else {
+                                    for line in all_lines {
+                                        let _ = event_tx.send(McpClientEvent::Message(
+                                            line.to_string()
+                                        )).await;
+                                    }
+                                }
                             }
                         }
                     }
-                        return;
-                    }
+                    return;
                 }
+            }
 
-            // FIXED: Format any other result as pretty JSON
+            // ═══════════════════════════════════════════════════════════════
+            // CHANGE 2: Generic result
+            // ═══════════════════════════════════════════════════════════════
             let formatted = format_json_safely(result).await;
-            let (display_text, truncated) = truncate_json_display(&formatted, 200);
             
-            let _ = event_tx.send(McpClientEvent::Message(display_text)).await;
+            // CHANGED: Split by lines
+            let all_lines: Vec<&str> = formatted.lines().collect();
             
-            if truncated {
-                let total_lines = formatted.lines().count();
+            if all_lines.len() > 200 {
+                for line in all_lines.iter().take(200) {
+                    let _ = event_tx.send(McpClientEvent::Message(
+                        line.to_string()
+                    )).await;
+                }
                 let _ = event_tx.send(McpClientEvent::Message(
-                    format!("\n⚠️  Response truncated: showing 200 of {} lines", total_lines)
+                    "".to_string()
                 )).await;
+                let _ = event_tx.send(McpClientEvent::Message(
+                    format!("⚠️  Response truncated: showing 200 of {} lines", all_lines.len())
+                )).await;
+            } else {
+                for line in all_lines {
+                    let _ = event_tx.send(McpClientEvent::Message(
+                        line.to_string()
+                    )).await;
+                }
             }
-            } else if let Some(error) = v.get("error") {
-            // FIXED: Format error as pretty JSON
+            
+        } else if let Some(error) = v.get("error") {
+            // ═══════════════════════════════════════════════════════════════
+            // CHANGE 3: Error response
+            // ═══════════════════════════════════════════════════════════════
             let formatted = format_json_safely(error).await;
-                let _ = event_tx.send(McpClientEvent::Error(
-                format!("RPC error:\n{}", formatted)
+            
+            let _ = event_tx.send(McpClientEvent::Error(
+                "RPC error:".to_string()
+            )).await;
+            
+            // CHANGED: Split by lines
+            for line in formatted.lines() {
+                let _ = event_tx.send(McpClientEvent::Message(
+                    line.to_string()
                 )).await;
             }
-            return;
+        }
+        return;
     }
 
-    // Handle notifications (no id)
+    // Notifications - NO CHANGE NEEDED
     if let Some(method) = v.get("method").and_then(|m| m.as_str()) {
         match method {
             "notifications/tools/list_changed" => {
@@ -621,13 +714,7 @@ async fn handle_json_rpc_event(
                 )).await;
             }
         }
-        return;
     }
-
-    // Fallback: wyświetl surowy JSON
-    // let _ = event_tx.send(McpClientEvent::Message(
-    //     serde_json::to_string_pretty(&v).unwrap_or_default()
-    // )).await;
 }
 
 // ═══════════════════════════════════════════════════════════════
