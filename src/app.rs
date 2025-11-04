@@ -8,6 +8,8 @@ use crate::args::{args_to_json, usage_hint};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyModifiers};
 use tokio::sync::mpsc;
+use unicode_width::UnicodeWidthStr;
+
 use crate::completion::{CompletionContext, CommandBufferState};
 use crate::tool_formatter::{format_tool_detailed, format_tool_compact};
 
@@ -27,9 +29,10 @@ pub struct App {
     tool_selection: Option<ToolSelection>,
     mouse_enabled: bool,
     available_tools: Vec<ToolInfo>,
-    scroll_offset: u16,
+    scroll_offset: usize,
     autoscroll: bool,
     output_height: u16,
+    output_width: u16,
     command_state: CommandBufferState,
     completion_context: CompletionContext,
 }
@@ -80,6 +83,7 @@ impl App {
             scroll_offset: 0,
             autoscroll: true,
             output_height: 0, // Will be updated by the UI loop
+            output_width: 0,
         }
     }
 
@@ -96,37 +100,64 @@ impl App {
         //         height, self.output.lines().len());
         
         // Recalculate scroll on resize
-        self.scroll_to_bottom();
+        self.update_scroll_after_output_change();
     }
 
+    pub fn set_output_width(&mut self, width: u16) {
+        // store widget width (including borders)
+        self.output_width = width;
+        // recalculate scroll (we'll keep same semantic as with height)
 
+        self.update_scroll_after_output_change();
+        
+    }
+
+    fn wrap_width(&self) -> usize {
+        // subtract 2 for vertical borders (left+right)
+        self.output_width.saturating_sub(2) as usize
+    }
+
+    /// Returns number of *visual* lines after wrapping the stored logical lines
+    pub fn visual_lines_count(&self) -> usize {
+        let wrap = self.wrap_width().max(1);
+        self.output.lines().iter().map(|s| {
+            let w = UnicodeWidthStr::width(s.as_str());
+            // If string is empty -> one visual line
+            if w == 0 {
+                1usize
+            } else {
+                // ceil division
+                (w + wrap - 1) / wrap
+            }
+        }).sum()
+}    
 
     // ═══════════════════════════════════════════════════════════════
     // Scrolling methods
     // ═══════════════════════════════════════════════════════════════
 
-    fn view_height(&self) -> u16 {
-        // Visible content lines (excluding borders)
-        let vh = self.output_height.saturating_sub(2);
-        
-        // DEBUG
-        //eprintln!("DEBUG view_height: output_height={}, view_height={}", 
-        //          self.output_height, vh);
-        
-        vh
+
+    fn update_scroll_after_output_change(&mut self) {
+        let max_offset = self.max_scroll_offset();
+
+        if self.autoscroll || self.scroll_offset >= max_offset.saturating_sub(1) {
+            self.autoscroll = true;
+            self.scroll_offset = max_offset;
+        }
     }
 
-    fn max_scroll_offset(&self) -> u16 {
-        let content_len = self.output.lines().len() as u16;
-        let view_height = self.view_height();
-        let max_offset = content_len.saturating_sub(view_height);
-        
-        // DEBUG
-        //eprintln!("DEBUG max_scroll_offset: content={}, view={}, max={}", 
-        //          content_len, view_height, max_offset);
 
-        max_offset
+    fn view_height(&self) -> usize {
+        // visible rows (excluding border lines)
+        self.output_height.saturating_sub(2) as usize
     }
+
+    pub fn max_scroll_offset(&mut self) -> usize {
+        let content_visual = self.visual_lines_count();
+        let view_h = self.view_height();
+        content_visual.saturating_sub(view_h)
+    }
+
 
     fn enable_autoscroll(&mut self) {
         self.autoscroll = true;
@@ -138,44 +169,39 @@ impl App {
 
     /// Scrolls to the bottom of the output buffer if autoscroll is enabled.
     /// This is the primary method for auto-scrolling.
-    fn scroll_to_bottom(&mut self) {
-        if self.autoscroll {
-            let max = self.max_scroll_offset();
-            self.scroll_offset = max;
+    // fn update_scroll_after_output_change(&mut self) {
+    //     if self.autoscroll {
+    //         let max = self.max_scroll_offset();
+    //         self.scroll_offset = max;
             
-            // DEBUG
-            //eprintln!("DEBUG scroll_to_bottom: setting scroll_offset to {}", max);
-        }
-    }
+    //         // DEBUG
+    //         //eprintln!("DEBUG update_scroll_after_output_change: setting scroll_offset to {}", max);
+    //     }
+    // }
 
 
     /// Scrolls up one line, disabling autoscroll.
     fn scroll_up(&mut self) {
         self.disable_autoscroll();
         self.scroll_offset = self.scroll_offset.saturating_sub(1);
+        self.autoscroll = false;
     }
 
     /// Scrolls down one line. If the bottom is reached, re-enables autoscroll.
     fn scroll_down(&mut self) {
-        self.disable_autoscroll();
         let max_offset = self.max_scroll_offset();
-        
-        //eprintln!("DEBUG scroll_down: current={}, max={}", self.scroll_offset, max_offset);
-        
         if self.scroll_offset < max_offset {
             self.scroll_offset += 1;
-        }
-        
-        // Re-enable autoscroll if at bottom
-        if self.scroll_offset >= max_offset {
-            self.enable_autoscroll();
+            self.autoscroll = false;
+        } else {
+            self.autoscroll = true;
         }
     }
 
     /// Jumps to the bottom and re-enables autoscroll.
     fn jump_to_bottom(&mut self) {
         self.enable_autoscroll();
-        self.scroll_to_bottom();
+        self.update_scroll_after_output_change();
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -190,7 +216,7 @@ impl App {
         self.output.lines()
     }
 
-    pub const fn scroll_offset(&self) -> u16 {
+    pub const fn scroll_offset(&self) -> usize {
         self.scroll_offset
     }
 
@@ -258,7 +284,7 @@ impl App {
             McpClientEvent::LargeResponse { total_lines, chunk } => {
                 self.output = self.output.with_message(chunk);
                 self.status = format!("Receiving large response ({} lines)...", total_lines);
-                self.scroll_to_bottom();
+                self.update_scroll_after_output_change();
             }
             McpClientEvent::Connected => {
                 self.status = "MCP client connected".into();
@@ -270,11 +296,11 @@ impl App {
             }
             McpClientEvent::Message(msg) => {
                 self.output = self.output.with_message(msg);
-                self.scroll_to_bottom();
+                self.update_scroll_after_output_change();
             }
             McpClientEvent::Error(err) => {
                 self.output = self.output.with_message(format!("❌ [MCP Error] {}", err));
-                self.scroll_to_bottom();
+                self.update_scroll_after_output_change();
             }
             McpClientEvent::ToolsListed(tools) => {
                 // CRITICAL: Store tools in App state FIRST
@@ -305,13 +331,13 @@ impl App {
                 self.output = self.output.with_message(
                     format!("Total: {} tools available - use :mcp tools or :mcp run", tools.len())
                 );
-                self.scroll_to_bottom();
+                self.update_scroll_after_output_change();
                 
                 self.status = format!("Loaded {} tools", tools.len());
             }
             McpClientEvent::Debug(msg) => {
                 self.output = self.output.with_message(format!("🔍 {}", msg));
-                self.scroll_to_bottom();
+                self.update_scroll_after_output_change();
             }
         }
         Ok(self)
@@ -500,7 +526,7 @@ impl App {
                         .output
                         .with_message(format!("→ {}", input))
                         .with_message(format!("← Echo: {}", input));
-                    self.scroll_to_bottom();
+                    self.update_scroll_after_output_change();
                     self.input_buffer = Buffer::new();
                     self.status = format!("Sent: {}", input);
                 }
@@ -666,7 +692,7 @@ async fn handle_command_key(mut self, code: KeyCode) -> Result<Self> {
             }
             KeyCode::Char('l') => {
                 self.output = OutputLog::new();
-                self.scroll_to_bottom();
+                self.update_scroll_after_output_change();
                 self.status = "Output cleared".into();
             }
             _ => {}
@@ -686,7 +712,7 @@ async fn handle_command_key(mut self, code: KeyCode) -> Result<Self> {
             }
             Ok(Command::Clear) => {
                 self.output = OutputLog::new();
-                self.scroll_to_bottom();
+                self.update_scroll_after_output_change();
                 self.status = "Output cleared".into();
             }
             Ok(Command::Echo(msg)) => {
@@ -710,7 +736,7 @@ async fn handle_command_key(mut self, code: KeyCode) -> Result<Self> {
                     .with_message("  :mcp run [tool_name]     - Run MCP tool (interactive or direct)".to_string())
                     .with_message("".to_string())
                     .with_message("  :h, :help                - Show this help".to_string());
-                self.scroll_to_bottom();
+                self.update_scroll_after_output_change();
                 self.status = "Help displayed".into();
             }
             Ok(Command::McpConnect(server_name)) => {
@@ -746,7 +772,7 @@ async fn handle_command_key(mut self, code: KeyCode) -> Result<Self> {
                         });
                         self.status = "Select server with ↑↓ or number keys".into();
                     }
-                    self.scroll_to_bottom();
+                    self.update_scroll_after_output_change();
                 }
             }
             Ok(Command::McpList) => {
@@ -760,7 +786,7 @@ async fn handle_command_key(mut self, code: KeyCode) -> Result<Self> {
                             .with_message(format!("  • {}: {}", server.name, server.url));
                     }
                 }
-                self.scroll_to_bottom();
+                self.update_scroll_after_output_change();
             }
             Ok(Command::McpTools) => {
                 if self.available_tools.is_empty() {
@@ -785,7 +811,7 @@ async fn handle_command_key(mut self, code: KeyCode) -> Result<Self> {
                         format!("Total: {} tools - use :mcp tool <name> for details", self.available_tools.len())
                     );
                 }
-                self.scroll_to_bottom();
+                self.update_scroll_after_output_change();
             }
         // NEW: McpTool - detailed tool description
         Ok(Command::McpTool(tool_name)) => {
@@ -816,7 +842,7 @@ async fn handle_command_key(mut self, code: KeyCode) -> Result<Self> {
                 
                 self.status = format!("Tool '{}' not found", tool_name);
             }
-            self.scroll_to_bottom();
+            self.update_scroll_after_output_change();
         }
 
         Ok(Command::McpStatus) => {
@@ -844,7 +870,7 @@ async fn handle_command_key(mut self, code: KeyCode) -> Result<Self> {
                     );
                 }
             }
-            self.scroll_to_bottom();
+            self.update_scroll_after_output_change();
             self.status = "Status displayed".into();
         }
 
@@ -903,7 +929,7 @@ async fn handle_command_key(mut self, code: KeyCode) -> Result<Self> {
                 });
                 self.status = "Select tool with ↑↓ or number keys".into();
             }
-            self.scroll_to_bottom();
+            self.update_scroll_after_output_change();
         }
 
         Ok(Command::Mouse(enabled)) => {
@@ -919,7 +945,7 @@ async fn handle_command_key(mut self, code: KeyCode) -> Result<Self> {
                     "Mouse capture disabled. You can now use terminal selection (Ctrl+Shift+C to copy).".to_string()
                 }
             );
-            self.scroll_to_bottom();
+            self.update_scroll_after_output_change();
             self.status = format!("Mouse capture {}", state);
         }
         Err(e) => {

@@ -52,7 +52,19 @@ impl UI {
     // Output area rendering
     // ═══════════════════════════════════════════════════════════════
 
-fn render_output(&self, frame: &mut Frame, app: &App, area: Rect) {
+fn render_output(&self, frame: &mut Frame, app: &mut App, area: Rect) {
+
+    app.set_output_width(area.width);
+
+     // compute visual length using app.visual_lines_count()
+    let content_visual_len = app.visual_lines_count();
+
+    // clamp scroll_offset to valid range (in visual lines)
+    let max_offset = app.max_scroll_offset();
+    let mut scroll_offset = app.scroll_offset();
+    if scroll_offset > max_offset { scroll_offset = max_offset; /* also update app */ }
+   
+
     let lines: Vec<Line> = app
         .output()
         .iter()
@@ -69,8 +81,7 @@ fn render_output(&self, frame: &mut Frame, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ));
 
-    // CRITICAL: Verify scroll offset calculation
-    let scroll_offset = app.scroll_offset();
+
     
     // DEBUG: Add temporary logging (remove in production)
     // eprintln!("DEBUG render_output:");
@@ -82,12 +93,12 @@ fn render_output(&self, frame: &mut Frame, app: &App, area: Rect) {
     let paragraph = Paragraph::new(lines)
         .block(block)
         .wrap(Wrap { trim: false })
-        .scroll((scroll_offset, 0));
+        .scroll((scroll_offset as u16, 0));
 
     frame.render_widget(paragraph, area);
 
     // Scrollbar rendering (existing code)
-    let content_length = app.output().len();
+    let content_length = content_visual_len;
     if content_length > area.height as usize - 2 {
         let scrollbar = Scrollbar::default()
             .orientation(ScrollbarOrientation::VerticalRight)
@@ -293,7 +304,7 @@ fn render_output(&self, frame: &mut Frame, app: &App, area: Rect) {
     }    
 
     // Update the main render method to include completion popup
-    pub fn render(&self, frame: &mut Frame, app: &App) {
+    pub fn render(&self, frame: &mut Frame, app: &mut App) {
         let layout = Self::create_layout(frame.area());
 
         self.render_output(frame, app, layout.output);

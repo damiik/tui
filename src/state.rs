@@ -1,5 +1,7 @@
 /// Immutable text buffer with cursor position
 /// Pure functional data structure
+
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Buffer {
     content: String,

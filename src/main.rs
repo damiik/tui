@@ -69,13 +69,13 @@ async fn run_loop(
                 .split(ratatui::layout::Rect::new(0, 0, size.width, size.height));
             
             // chunks[0] is the actual output area
-            let output_area_height = chunks[0].height;
             
-            app.set_output_height(output_area_height);
+            app.set_output_height(chunks[0].height);
+            app.set_output_width(chunks[0].width);
             last_size = size;
         }
 
-        terminal.draw(|frame| ui.render(frame, &app))?;
+        terminal.draw(|frame| ui.render(frame, &mut app))?;
 
         // Handle mouse capture state changes
         let current_mouse_state = app.mouse_enabled();

@@ -1403,6 +1403,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "unicode-width 0.1.14",
  "uuid",
 ]
 
