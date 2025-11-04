@@ -562,22 +562,50 @@ async fn handle_json_rpc_event(
                                     "📋 Tool result:".to_string()
                                 )).await;
                                 
-                                let _ = event_tx.send(McpClientEvent::Message(display_text)).await;
+                                // CRITICAL FIX: Split by lines and send separately
+                                for line in display_text.lines() {
+                                    let _ = event_tx.send(McpClientEvent::Message(
+                                        line.to_string()
+                                    )).await;
+                                }
                                 
                                 if truncated {
                                     let total_lines = formatted.lines().count();
                                     let _ = event_tx.send(McpClientEvent::Message(
-                                        format!("\n⚠️  Response truncated: showing 200 of {} lines", total_lines)
+                                        "".to_string()
                                     )).await;
                                     let _ = event_tx.send(McpClientEvent::Message(
-                                        "💡 Tip: Large responses may cause display issues".to_string()
+                                        format!("⚠️  Response truncated: showing 200 of {} lines", total_lines)
+                                    )).await;
+                                    let _ = event_tx.send(McpClientEvent::Message(
+                                        "💡 Full response may cause UI performance issues".to_string()
                                     )).await;
                                 }
                             } else {
-                                // Not JSON, display as-is
+                                // Not JSON - plain text
+                                let lines: Vec<&str> = text.lines().collect();
+                                
                                 let _ = event_tx.send(McpClientEvent::Message(
-                                    format!("📋 Tool result:\n{}", text)
+                                    "📋 Tool result:".to_string()
                                 )).await;
+                                
+                                // CRITICAL FIX: Send line by line
+                                let max_lines = 200;
+                                for (i, line) in lines.iter().enumerate() {
+                                    if i >= max_lines {
+                                        break;
+                                    }
+                                    let _ = event_tx.send(McpClientEvent::Message(
+                                        line.to_string()
+                                    )).await;
+                                }
+                                
+                                if lines.len() > max_lines {
+                                    let _ = event_tx.send(McpClientEvent::Message(
+                                        format!("\n⚠️  Output truncated: {} of {} lines shown", 
+                                                max_lines, lines.len())
+                                    )).await;
+                                }
                             }
                         }
                     }
@@ -585,24 +613,45 @@ async fn handle_json_rpc_event(
                     }
                 }
 
-            // FIXED: Format any other result as pretty JSON
+            // ═══════════════════════════════════════════════════════════════
+            // FIX: Generic result - send line by line
+            // ═══════════════════════════════════════════════════════════════
             let formatted = format_json_safely(result).await;
             let (display_text, truncated) = truncate_json_display(&formatted, 200);
             
-            let _ = event_tx.send(McpClientEvent::Message(display_text)).await;
+            // CRITICAL FIX: Split by lines
+            for line in display_text.lines() {
+                let _ = event_tx.send(McpClientEvent::Message(
+                    line.to_string()
+                )).await;
+            }
             
             if truncated {
                 let total_lines = formatted.lines().count();
                 let _ = event_tx.send(McpClientEvent::Message(
-                    format!("\n⚠️  Response truncated: showing 200 of {} lines", total_lines)
+                    "".to_string()
+                )).await;
+                let _ = event_tx.send(McpClientEvent::Message(
+                    format!("⚠️  Response truncated: showing 200 of {} lines", total_lines)
                 )).await;
             }
+            
             } else if let Some(error) = v.get("error") {
-            // FIXED: Format error as pretty JSON
+            // ═══════════════════════════════════════════════════════════════
+            // FIX: Error response - send line by line
+            // ═══════════════════════════════════════════════════════════════
             let formatted = format_json_safely(error).await;
+            
+            let _ = event_tx.send(McpClientEvent::Error(
+                "RPC error:".to_string()
+            )).await;
+            
+            // CRITICAL FIX: Split by lines
+            for line in formatted.lines() {
                 let _ = event_tx.send(McpClientEvent::Error(
-                format!("RPC error:\n{}", formatted)
+                    line.to_string()
                 )).await;
+            }
             }
             return;
     }
