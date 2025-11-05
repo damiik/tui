@@ -1,209 +1,132 @@
-# MCP Test Client
+# TUI MCP Client
 
-Elegancki klient MCP (Model Context Protocol) z interfejsem terminalowym inspirowanym filozofią Vim.
+A terminal-based UI client for the Model Context Protocol (MCP), inspired by Vim's modal interface. It allows for interactive communication with MCP-compliant servers, tool execution, and context management directly from the command line.
 
-## Nowe funkcje
+## Features
 
-### 🔍 Rozszerzone debugowanie
-- Szczegółowe logi procesu połączenia
-- Śledzenie SSE event stream
-- Debug JSON-RPC request/response
-- Informacje o inicjalizacji sesji
+- **Modal Interface**: Vim-like `NORMAL`, `INSERT`, and `COMMAND` modes for efficient, keyboard-driven interaction.
+- **MCP Communication**: Connects to MCP servers via Server-Sent Events (SSE) and JSON-RPC.
+- **Interactive Selection Menus**: Easily select servers and tools from dynamic lists.
+- **Command System**: A rich set of commands for controlling the application, managing connections, and interacting with tools.
+- **Command Completion**: Press `Tab` in `COMMAND` mode to auto-complete commands, tool names, and server names.
+- **Command History**: Navigate through previously executed commands using the `Up` and `Down` arrow keys.
+- **Tool Inspection**: View detailed information about available tools, including descriptions and input schemas.
+- **Dynamic Layout**: The UI adapts to different terminal sizes.
+- **Mouse Support**: Optional mouse capture for scrolling and other interactions.
+- **Configurable**: Define MCP server endpoints in an external `config.json` file.
 
-### 🎯 Interaktywny wybór serwera
-- `:mcp connect` otwiera menu wyboru
-- Nawigacja: `↑`/`↓` lub `j`/`k`
-- Wybór numerem: `1`, `2`, `3`...
-- `Enter` - połącz, `Esc` - anuluj
+## Configuration
 
-## Konfiguracja
+Create a `config.json` file in the root of the project directory to define the MCP servers you want to connect to.
 
-Utwórz plik `config.json` w głównym katalogu projektu:
-
+**`config.json` format:**
 ```json
 {
   "mcp_servers": [
     {
-      "name": "local-server",
-      "url": "http://localhost:8080"
+      "name": "local-dev",
+      "url": "http://localhost:8080/sse"
     },
     {
-      "name": "remote-server",
-      "url": "https://example.com/mcp"
+      "name": "staging-server",
+      "url": "https://mcp.staging.example.com"
     }
   ]
 }
 ```
 
-## Uruchomienie
+## How to Run
 
-```bash
-# Kompilacja
-cargo build --release
+1.  **Build the project:**
+    ```bash
+    cargo build --release
+    ```
 
-# Uruchomienie
-cargo run
+2.  **Run the application:**
+    ```bash
+    cargo run
+    ```
 
-# Z debugowaniem
-RUST_LOG=debug cargo run
-```
+## User Interface
 
-## Interface użytkownika
-
-### Layout
-```
-┌────────────────────────────────┐
-│         Output Area            │  ← Scrollowalna historia
-│  🔍 Debug messages             │  ← Z emoji dla czytelności
-│  📦 Response data              │
-│  ❌ Error messages             │
-├────────────────────────────────┤
-│ MODE  Status message  Help     │  ← Status bar
-├────────────────────────────────┤
-│ > input buffer_               │  ← Linia wejściowa
-└────────────────────────────────┘
-```
-
-### Tryby
-
-#### **NORMAL** (cyan)
-- `i` - INSERT mode
-- `:` - COMMAND mode  
-- `q` - szybkie wyjście
-- `Ctrl+Q` - wymuszenie wyjścia
-- `Ctrl+L` - czyszczenie outputu
-
-#### **INSERT** (green)
-- `ESC` - powrót do NORMAL
-- `Enter` - wysłanie wejścia
-- `Ctrl+W` - czyszczenie bufora
-- `←`/`→`/`Home`/`End` - nawigacja
-
-#### **COMMAND** (yellow)
-```
-:q, :quit              - wyjście
-:clear                 - czyszczenie outputu
-:echo <text>           - echo do outputu
-:mcp connect           - wybór serwera (interaktywny)
-:mcp connect <name>    - połączenie bezpośrednie
-:mcp list              - lista skonfigurowanych serwerów
-:mcp tools             - lista narzędzi MCP
-:h, :help              - pomoc
-```
-
-#### **SELECT** (magenta)
-Tryb wyboru serwera MCP:
-- `↑`/`↓` lub `j`/`k` - nawigacja
-- `1`-`9` - wybór bezpośredni
-- `Enter` - potwierdź wybór
-- `Esc` - anuluj
-
-## Debugowanie połączenia MCP
-
-Aplikacja wyświetla szczegółowe informacje o procesie połączenia:
+The UI is split into three main sections:
 
 ```
-🔌 Connecting to local-server at http://localhost:8080
-📡 Initial response: HTTP 200
-📥 Waiting for SSE endpoint...
-📨 SSE event='endpoint' data='/session/abc123'
-✅ Received endpoint: /session/abc123
-🔗 Session endpoint: http://localhost:8080/session/abc123
-🎧 Starting SSE listener on http://localhost:8080/session/abc123
-📤 Sending initialize: {...}
-📥 Initialize response: HTTP 200
-✅ MCP session initialized
+┌───────────────────────────────────────────────────┐
+│ 📦 Available tools:                               │  ← Output Area
+│   • read_file: Reads a file from the filesystem.  │  (Scrollable history of commands and responses)
+│   • list_directory: Lists files in a directory.   │
+│                                                   │
+├───────────────────────────────────────────────────┤
+│ NORMAL | Ready                                    │  ← Status Bar
+├───────────────────────────────────────────────────┤
+│ :mcp tools_                                       │  ← Input/Command Line
+└───────────────────────────────────────────────────┘
 ```
 
-### Typowe problemy
+### Modes
 
-**❌ POST HTTP error: 405 Method Not Allowed**
-- Serwer nie przyjmuje POST na danym endpointcie
-- Sprawdź czy endpoint SSE zwrócił poprawną ścieżkę sesji
-- Weryfikuj logi: `📨 SSE event='endpoint'`
+-   **NORMAL** (`Cyan`): The default mode for navigation and entering other modes.
+-   **INSERT** (`Green`): For typing input to be sent to the server (currently echoes back).
+-   **COMMAND** (`Yellow`): For entering commands to control the application (e.g., `:q`, `:mcp connect`).
+-   **SELECT** (`Magenta`): An interactive mode for selecting a server or tool from a list.
 
-**⚠️ No endpoint received from server**
-- Serwer nie wysłał SSE event `endpoint`
-- Sprawdź format odpowiedzi serwera
-- Możliwe że serwer używa innego protokołu
+### Keybindings
 
-**Stream ended without endpoint**
-- Połączenie SSE zamknęło się przed wysłaniem endpointu
-- Sprawdź logi serwera MCP
-- Weryfikuj czy serwer poprawnie implementuje SSE
+| Mode      | Key(s)                  | Action                                           |
+| :-------- | :---------------------- | :----------------------------------------------- |
+| **NORMAL**  | `i`                     | Enter `INSERT` mode.                             |
+|           | `:`                     | Enter `COMMAND` mode.                            |
+|           | `q`                     | Quit the application.                            |
+|           | `k` / `Up`              | Scroll output up.                                |
+|           | `j` / `Down`            | Scroll output down.                              |
+|           | `PageUp` / `PageDown`   | Scroll output by a full page.                    |
+|           | `End`                   | Jump to the bottom of the output (enables autoscroll). |
+|           | `Ctrl+L`                | Clear the output area.                           |
+| **INSERT**  | `Esc`                   | Return to `NORMAL` mode.                         |
+|           | `Enter`                 | Send the input.                                  |
+|           | `Backspace`             | Delete character before the cursor.              |
+|           | `Left`/`Right`/`Home`/`End` | Navigate the input line.                     |
+| **COMMAND** | `Esc`                   | Return to `NORMAL` mode.                         |
+|           | `Enter`                 | Execute the command or apply completion.         |
+|           | `Tab`                   | Trigger command/argument completion.             |
+|           | `Up`/`Down`             | Navigate command history or completion list.     |
+|           | `Backspace`             | Delete character before the cursor.              |
+|           | `Left`/`Right`/`Home`/`End` | Navigate the command line.                   |
+| **SELECT**  | `k` / `Up`              | Move selection up.                               |
+|           | `j` / `Down`            | Move selection down.                             |
+|           | `Enter`                 | Confirm selection.                               |
+|           | `Esc`                   | Cancel selection and return to `NORMAL` mode.    |
 
-## Przykładowa sesja
+## Commands
 
-```
-[NORMAL] Start
-  ↓ :
-[COMMAND] mcp connect
-  ↓ Enter
-[SELECT] 
-  🔌 Select MCP server:
-    → [1] local-server: http://localhost:8080
-      [2] remote-server: https://example.com/mcp
-  
-  Use ↑↓ or j/k to navigate, Enter to connect
-  ↓ Enter
-[NORMAL]
-  🔌 Connecting to local-server at http://localhost:8080
-  📡 Initial response: HTTP 200
-  📥 Waiting for SSE endpoint...
-  ✅ Received endpoint: /session/abc123
-  ✅ MCP session initialized
-  ↓ :
-[COMMAND] mcp tools
-  ↓ Enter
-[NORMAL]
-  📤 Sending tools/list (id=2)
-  📦 Available tools:
-    • read_file
-    • write_file
-    • list_directory
-```
+Commands are entered in `COMMAND` mode, prefixed with `:`.
 
-## Architektura
+| Command                             | Alias       | Description                                                              |
+| :---------------------------------- | :---------- | :----------------------------------------------------------------------- |
+| `:q`, `:quit`                       |             | Exit the application.                                                    |
+| `:clear`                            |             | Clear the output area.                                                   |
+| `:echo <text>`                      |             | Print `<text>` to the output area.                                       |
+| `:h`, `:help`                       |             | Show the help message with all available commands.                       |
+| `:mouse on` / `:mouse off`          |             | Enable or disable mouse capture.                                         |
+| `:mcp list`                         |             | List all configured MCP servers from `config.json`.                      |
+| `:mcp connect [name]`               | `:mcp cn`   | Connect to an MCP server. Opens an interactive menu if `[name]` is omitted. |
+| `:mcp status`                       |             | Show the current MCP connection status and number of loaded tools.       |
+| `:mcp tools`                        |             | List all available tools from the connected MCP server.                  |
+| `:mcp tool <tool_name>`             |             | Show a detailed description of `<tool_name>`, including its input schema. |
+| `:mcp run [tool_name] [args...]`    |             | Execute a tool. Opens an interactive menu if `[tool_name]` is omitted.   |
 
-### Funkcyjne wzorce
-- **Immutowalne transformacje stanu** - `App::handle_event(self, event) -> Result<Self>`
-- **Czyste struktury danych** - `Buffer`, `OutputLog`, `Mode`
-- **Algebraiczne typy** - `Command`, `McpClientEvent` jako enums
-- **Async event streaming** - tokio channels + SSE
+## Architecture
 
-### Moduły
-```
-src/
-├── main.rs         # Entry point + event loop
-├── app.rs          # State machine z server selection
-├── mcp.rs          # MCP client (SSE + JSON-RPC)
-├── command.rs      # Command parser
-├── config.rs       # Configuration loader
-├── mode.rs         # Modal states
-├── state.rs        # Immutable buffers
-├── event.rs        # Event abstraction
-└── ui.rs           # Pure rendering
-```
+The application follows a functional, event-driven architecture inspired by Elm.
 
-## MCP Protocol Support
-
-Implementowane features:
-- ✅ SSE transport
-- ✅ JSON-RPC 2.0
-- ✅ `initialize` method
-- ✅ `tools/list` method
-- ✅ Session endpoint discovery
-- ✅ Async request/response matching
-- ⏳ `tools/call` (TODO)
-- ⏳ `resources/*` (TODO)
-- ⏳ `prompts/*` (TODO)
-
-## Rozszerzalność
-
-Dodawanie nowych komend MCP:
-1. Extend `Command` enum w `command.rs`
-2. Add parsing logic w `Command::parse()`
-3. Handle w `App::execute_command()`
-4. Implement w `McpClient`
-
-Wszystko przez kompozycję, zero dziedziczenia!
+-   **`main.rs`**: The entry point, responsible for setting up the terminal, initializing the `App`, and running the main event loop.
+-   **`app.rs`**: The core state machine. It holds all application state and handles state transitions in response to events.
+-   **`ui.rs`**: Contains all rendering logic. It is a pure function that maps the `App` state to the terminal frame.
+-   **`event.rs`**: Defines the main event loop and abstracts away terminal events.
+-   **`mcp.rs`**: The MCP client, responsible for handling SSE connections, sending JSON-RPC requests, and receiving responses.
+-   **`command.rs`**: The command parser, which validates and translates command strings into structured `Command` enums.
+-   **`config.rs`**: Handles loading and parsing the `config.json` file.
+-   **`state.rs`**: Defines simple, immutable data structures for buffers and logs.
+-   **`mode.rs`**: Defines the different application modes (`Normal`, `Insert`, `Command`).
+-   **`completion.rs`**: Implements the logic for command completion and history.
