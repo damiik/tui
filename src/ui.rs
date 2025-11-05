@@ -55,15 +55,15 @@ impl UI {
 fn render_output(&self, frame: &mut Frame, app: &mut App, area: Rect) {
 
     app.set_output_width(area.width);
-
-     // compute visual length using app.visual_lines_count()
-    let content_visual_len = app.visual_lines_count();
-
-    // clamp scroll_offset to valid range (in visual lines)
+    app.set_output_height(area.height); // ADDED THIS LINE
     let max_offset = app.max_scroll_offset();
-    let mut scroll_offset = app.scroll_offset();
-    if scroll_offset > max_offset { scroll_offset = max_offset; /* also update app */ }
-   
+    let scroll = app.scroll_offset().min(max_offset);
+    app.set_scroll_offset(scroll); // Zsynchronizuj stan
+    // compute visual length using app.visual_lines_count()
+    //let content_visual_len = app.visual_lines_count();
+    let content_visual = app.content_visual_len();
+
+
 
     let lines: Vec<Line> = app
         .output()
@@ -71,50 +71,29 @@ fn render_output(&self, frame: &mut Frame, app: &mut App, area: Rect) {
         .map(|s| Line::from(s.as_str()))
         .collect();
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
-        .title(Span::styled(
-            " Output ",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ));
-
-
-    
-    // DEBUG: Add temporary logging (remove in production)
-    // eprintln!("DEBUG render_output:");
-    // eprintln!("  area.height = {}", area.height);
-    // eprintln!("  lines.len() = {}", lines.len());
-    // eprintln!("  scroll_offset = {}", scroll_offset);
-    // eprintln!("  view_height = {}", area.height.saturating_sub(2));
-
     let paragraph = Paragraph::new(lines)
-        .block(block)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray))
+                .title(Span::styled(" Output ", Style::default().fg(Color::Cyan)))
+        )
         .wrap(Wrap { trim: false })
-        .scroll((scroll_offset as u16, 0));
+        .scroll((scroll as u16, 0)); // visual scroll ✅
 
     frame.render_widget(paragraph, area);
 
-    // Scrollbar rendering (existing code)
-    let content_length = content_visual_len;
-    if content_length > area.height as usize - 2 {
-        let scrollbar = Scrollbar::default()
-            .orientation(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(Some("↑"))
-            .end_symbol(Some("↓"));
-
-        let mut scrollbar_state = ScrollbarState::new(content_length)
-            .position(scroll_offset as usize);
-
+    // Scrollbar correct metrics ✅
+    if content_visual > app.view_height() {
+        let mut sb_state = ScrollbarState::new(content_visual)
+            .position(scroll);
         frame.render_stateful_widget(
-            scrollbar,
+            Scrollbar::default(),
             area.inner(ratatui::layout::Margin {
                 vertical: 1,
                 horizontal: 0,
             }),
-            &mut scrollbar_state,
+            &mut sb_state,
         );
     }
 }

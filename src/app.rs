@@ -67,7 +67,7 @@ impl App {
         Self {
             mode: Mode::Normal,
             output: OutputLog::new()
-                .with_message("MCP Client initialized. Press 'i' for INSERT mode.".to_string()),
+                .with_message("MCP Client initialized. \nPress ':' for COMMAND mode. (type :h <ENTER> for help)".to_string()),
             input_buffer: Buffer::new(),
             command_state: CommandBufferState::new(), // NEW
             completion_context,                       // NEW
@@ -91,25 +91,51 @@ impl App {
     // State modifiers
     // ═══════════════════════════════════════════════════════════════
 
+    // pub fn set_output_height(&mut self, height: u16) {
+    //     // Store the WIDGET height (including borders)
+    //     self.output_height = height;
+        
+    //     // DEBUG
+    //     //eprintln!("DEBUG set_output_height: height={}, content_lines={}", 
+    //     //         height, self.output.lines().len());
+        
+    //     // Recalculate scroll on resize
+    //     self.update_scroll_after_output_change();
+    // }
+
+    // pub fn set_output_width(&mut self, width: u16) {
+    //     // store widget width (including borders)
+    //     self.output_width = width;
+    //     // recalculate scroll (we'll keep same semantic as with height)
+
+    //     self.update_scroll_after_output_change();
+        
+    // }
+
     pub fn set_output_height(&mut self, height: u16) {
-        // Store the WIDGET height (including borders)
-        self.output_height = height;
-        
-        // DEBUG
-        //eprintln!("DEBUG set_output_height: height={}, content_lines={}", 
-        //         height, self.output.lines().len());
-        
-        // Recalculate scroll on resize
-        self.update_scroll_after_output_change();
+        // Only update and scroll if the height has actually changed.
+        if self.output_height != height {
+            self.output_height = height;
+            if self.autoscroll {
+                self.scroll_to_bottom();
+            } else {
+                // If not autoscrolling, just ensure the offset is still valid.
+                self.clamp_scroll_offset();
+            }
+        }
     }
 
     pub fn set_output_width(&mut self, width: u16) {
-        // store widget width (including borders)
-        self.output_width = width;
-        // recalculate scroll (we'll keep same semantic as with height)
-
-        self.update_scroll_after_output_change();
-        
+        // Only update and scroll if the width has actually changed.
+        if self.output_width != width {
+            self.output_width = width;
+            if self.autoscroll {
+                self.scroll_to_bottom();
+            } else {
+                // If not autoscrolling, just ensure the offset is still valid.
+                self.clamp_scroll_offset();
+            }
+        }
     }
 
     fn wrap_width(&self) -> usize {
@@ -137,26 +163,26 @@ impl App {
     // ═══════════════════════════════════════════════════════════════
 
 
-    fn update_scroll_after_output_change(&mut self) {
-        let max_offset = self.max_scroll_offset();
+    // fn update_scroll_after_output_change(&mut self) {
+    //     let max_offset = self.max_scroll_offset();
 
-        if self.autoscroll || self.scroll_offset >= max_offset.saturating_sub(1) {
-            self.autoscroll = true;
-            self.scroll_offset = max_offset;
-        }
-    }
+    //     if self.autoscroll || self.scroll_offset >= max_offset.saturating_sub(1) {
+    //         self.autoscroll = true;
+    //         self.scroll_offset = max_offset;
+    //     }
+    // }
 
 
-    fn view_height(&self) -> usize {
-        // visible rows (excluding border lines)
-        self.output_height.saturating_sub(2) as usize
-    }
+    // fn view_height(&self) -> usize {
+    //     // visible rows (excluding border lines)
+    //     self.output_height.saturating_sub(2) as usize
+    // }
 
-    pub fn max_scroll_offset(&mut self) -> usize {
-        let content_visual = self.visual_lines_count();
-        let view_h = self.view_height();
-        content_visual.saturating_sub(view_h)
-    }
+    // pub fn max_scroll_offset(&mut self) -> usize {
+    //     let content_visual = self.visual_lines_count();
+    //     let view_h = self.view_height();
+    //     content_visual.saturating_sub(view_h)
+    // }
 
 
     fn enable_autoscroll(&mut self) {
@@ -165,6 +191,10 @@ impl App {
 
     fn disable_autoscroll(&mut self) {
         self.autoscroll = false;
+    }
+    pub fn set_scroll_offset(&mut self, off: usize) {
+        self.scroll_offset = off;
+        self.clamp_scroll_offset();
     }
 
     /// Scrolls to the bottom of the output buffer if autoscroll is enabled.
@@ -180,28 +210,56 @@ impl App {
     // }
 
 
-    /// Scrolls up one line, disabling autoscroll.
-    fn scroll_up(&mut self) {
-        self.disable_autoscroll();
-        self.scroll_offset = self.scroll_offset.saturating_sub(1);
-        self.autoscroll = false;
+//--------------------------------------------------
+// Canonical scroll state
+//--------------------------------------------------
+
+    // Always visual line indexing!
+    pub fn view_height(&self) -> usize {
+        self.output_height.saturating_sub(2) as usize
     }
 
-    /// Scrolls down one line. If the bottom is reached, re-enables autoscroll.
-    fn scroll_down(&mut self) {
-        let max_offset = self.max_scroll_offset();
-        if self.scroll_offset < max_offset {
-            self.scroll_offset += 1;
-            self.autoscroll = false;
-        } else {
-            self.autoscroll = true;
+    pub fn content_visual_len(&self) -> usize {
+        self.visual_lines_count()
+    }
+
+    pub fn max_scroll_offset(&self) -> usize {
+        self.content_visual_len().saturating_sub(self.view_height())
+    }
+
+    pub fn clamp_scroll_offset(&mut self) {
+        let max = self.max_scroll_offset();
+        if self.scroll_offset > max {
+            self.scroll_offset = max;
         }
+    }
+
+    // Move scroll
+    pub fn scroll_up(&mut self) {
+            self.disable_autoscroll();
+            self.scroll_offset = self.scroll_offset.saturating_sub(1);
+    }
+
+    pub fn scroll_down(&mut self) {
+        self.disable_autoscroll();
+        let max = self.max_scroll_offset();
+        if self.scroll_offset < max {
+                self.scroll_offset += 1;
+        }
+        else {
+            self.enable_autoscroll();
+        }
+    }
+
+    pub fn scroll_to_bottom(&mut self) {
+        self.enable_autoscroll();
+        self.scroll_offset = self.max_scroll_offset();
     }
 
     /// Jumps to the bottom and re-enables autoscroll.
     fn jump_to_bottom(&mut self) {
         self.enable_autoscroll();
-        self.update_scroll_after_output_change();
+        self.scroll_to_bottom();
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -284,7 +342,7 @@ impl App {
             McpClientEvent::LargeResponse { total_lines, chunk } => {
                 self.output = self.output.with_message(chunk);
                 self.status = format!("Receiving large response ({} lines)...", total_lines);
-                self.update_scroll_after_output_change();
+                self.scroll_to_bottom();
             }
             McpClientEvent::Connected => {
                 self.status = "MCP client connected".into();
@@ -296,11 +354,11 @@ impl App {
             }
             McpClientEvent::Message(msg) => {
                 self.output = self.output.with_message(msg);
-                self.update_scroll_after_output_change();
+                self.scroll_to_bottom();
             }
             McpClientEvent::Error(err) => {
                 self.output = self.output.with_message(format!("❌ [MCP Error] {}", err));
-                self.update_scroll_after_output_change();
+                self.scroll_to_bottom();
             }
             McpClientEvent::ToolsListed(tools) => {
                 // CRITICAL: Store tools in App state FIRST
@@ -331,13 +389,13 @@ impl App {
                 self.output = self.output.with_message(
                     format!("Total: {} tools available - use :mcp tools or :mcp run", tools.len())
                 );
-                self.update_scroll_after_output_change();
+                self.scroll_to_bottom();
                 
                 self.status = format!("Loaded {} tools", tools.len());
             }
             McpClientEvent::Debug(msg) => {
                 self.output = self.output.with_message(format!("🔍 {}", msg));
-                self.update_scroll_after_output_change();
+                self.scroll_to_bottom();
             }
         }
         Ok(self)
@@ -495,11 +553,22 @@ impl App {
             KeyCode::Char('q') => {
                 self.quit = true;
             }
-            KeyCode::PageUp | KeyCode::Char('k') => {
+            KeyCode::Up | KeyCode::Char('k') => {
                 self.scroll_up();
+                self.status = "Scrolled up".into();
             }
-            KeyCode::PageDown | KeyCode::Char('j') => {
+            KeyCode::Down | KeyCode::Char('j') => {
                 self.scroll_down();
+                self.status = "Scrolled down".into();
+            }
+            KeyCode::PageUp => {
+                self.disable_autoscroll();
+                self.scroll_offset = self.scroll_offset.saturating_sub(self.view_height() as usize);
+            }
+            KeyCode::PageDown => {
+                self.disable_autoscroll();
+                let max = self.max_scroll_offset();
+                self.scroll_offset = (self.scroll_offset + self.view_height() as usize).min(max);
             }
             KeyCode::End => {
                 self.jump_to_bottom();
@@ -526,7 +595,7 @@ impl App {
                         .output
                         .with_message(format!("→ {}", input))
                         .with_message(format!("← Echo: {}", input));
-                    self.update_scroll_after_output_change();
+                    self.scroll_to_bottom();
                     self.input_buffer = Buffer::new();
                     self.status = format!("Sent: {}", input);
                 }
@@ -692,7 +761,7 @@ async fn handle_command_key(mut self, code: KeyCode) -> Result<Self> {
             }
             KeyCode::Char('l') => {
                 self.output = OutputLog::new();
-                self.update_scroll_after_output_change();
+                self.scroll_to_bottom();
                 self.status = "Output cleared".into();
             }
             _ => {}
@@ -712,7 +781,7 @@ async fn handle_command_key(mut self, code: KeyCode) -> Result<Self> {
             }
             Ok(Command::Clear) => {
                 self.output = OutputLog::new();
-                self.update_scroll_after_output_change();
+                self.scroll_to_bottom();
                 self.status = "Output cleared".into();
             }
             Ok(Command::Echo(msg)) => {
@@ -736,7 +805,7 @@ async fn handle_command_key(mut self, code: KeyCode) -> Result<Self> {
                     .with_message("  :mcp run [tool_name]     - Run MCP tool (interactive or direct)".to_string())
                     .with_message("".to_string())
                     .with_message("  :h, :help                - Show this help".to_string());
-                self.update_scroll_after_output_change();
+                self.scroll_to_bottom();
                 self.status = "Help displayed".into();
             }
             Ok(Command::McpConnect(server_name)) => {
@@ -772,7 +841,7 @@ async fn handle_command_key(mut self, code: KeyCode) -> Result<Self> {
                         });
                         self.status = "Select server with ↑↓ or number keys".into();
                     }
-                    self.update_scroll_after_output_change();
+                    self.scroll_to_bottom();
                 }
             }
             Ok(Command::McpList) => {
@@ -786,7 +855,7 @@ async fn handle_command_key(mut self, code: KeyCode) -> Result<Self> {
                             .with_message(format!("  • {}: {}", server.name, server.url));
                     }
                 }
-                self.update_scroll_after_output_change();
+                self.scroll_to_bottom();
             }
             Ok(Command::McpTools) => {
                 if self.available_tools.is_empty() {
@@ -811,7 +880,7 @@ async fn handle_command_key(mut self, code: KeyCode) -> Result<Self> {
                         format!("Total: {} tools - use :mcp tool <name> for details", self.available_tools.len())
                     );
                 }
-                self.update_scroll_after_output_change();
+                self.scroll_to_bottom();
             }
         // NEW: McpTool - detailed tool description
         Ok(Command::McpTool(tool_name)) => {
@@ -842,7 +911,7 @@ async fn handle_command_key(mut self, code: KeyCode) -> Result<Self> {
                 
                 self.status = format!("Tool '{}' not found", tool_name);
             }
-            self.update_scroll_after_output_change();
+            self.scroll_to_bottom();
         }
 
         Ok(Command::McpStatus) => {
@@ -870,7 +939,7 @@ async fn handle_command_key(mut self, code: KeyCode) -> Result<Self> {
                     );
                 }
             }
-            self.update_scroll_after_output_change();
+            self.scroll_to_bottom();
             self.status = "Status displayed".into();
         }
 
@@ -929,7 +998,7 @@ async fn handle_command_key(mut self, code: KeyCode) -> Result<Self> {
                 });
                 self.status = "Select tool with ↑↓ or number keys".into();
             }
-            self.update_scroll_after_output_change();
+            self.scroll_to_bottom();
         }
 
         Ok(Command::Mouse(enabled)) => {
@@ -945,7 +1014,7 @@ async fn handle_command_key(mut self, code: KeyCode) -> Result<Self> {
                     "Mouse capture disabled. You can now use terminal selection (Ctrl+Shift+C to copy).".to_string()
                 }
             );
-            self.update_scroll_after_output_change();
+            self.scroll_to_bottom();
             self.status = format!("Mouse capture {}", state);
         }
         Err(e) => {
